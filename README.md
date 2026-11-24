@@ -117,6 +117,7 @@ python3 "$S" get sfx/ "px:<id>" "fs:<id>" "mk:<id>" "kn:<pack>/<file>"
 
 - **Freesound / Pixabay 直连可用**，本机实测无需代理。Freesound 单连接限速约 80 KB/s，所以把多个 ID 放进同一个 `get` 并发拉取。
 - **Pixabay 在 Cloudflare 后面**：裸 `urllib` 会拿到 "Just a moment…"（HTTP 403），脚本用 `curl_cffi` 伪装 Chrome 的 TLS 指纹绕过去。venv 首次调用时自动建在 `~/.cache/sfx-sources/venv`（约 10 秒）；若 venv 损坏，脚本会自动重建一次。若某天又开始 403，说明 Cloudflare 收紧了，只能退回手工读搜索页。
+- **Pixabay 会限流（HTTP 429）**：连续快速搜索会触发。脚本按 8/16 秒退避并提示。若仍被限，Pixabay 结果会以「标题 + 点赞数 + detail unavailable」形式返回而不是整个消失——这表示拿不到 mp3 地址，需要照 `page` 链接手工打开或等一分钟重试。别猛刷：一次 `search` 比连打多个 `pixabay` 好。
 - Kenney 打包下载需要带 `Referer` 头，否则 403；脚本已处理，包只下一次，之后离线可搜。包是否装完以 `.complete` 标记为准，中断的解压会被重试而不是被误判为已完成。
 - **某个源突然返回空**：解析到 0 条时会往 stderr 打警告，所以"确实没有结果"和"站点改版了"能区分开。平时能用的源突然空了，先怀疑站点改版，不要怀疑查询词。
 - **商用前查许可证**：Freesound 默认 `any` 可能返回 BY-NC（不可商用），商用场景请加 `--license by` 或 `--license cc0`。Pixabay 无需署名，Kenney 全 CC0，Mixkit 免费商用。

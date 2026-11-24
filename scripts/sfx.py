@@ -110,6 +110,16 @@ def fetch(url, timeout=60, tries=3):
                 from curl_cffi import requests as cr
                 r = cr.get(url, impersonate="chrome", timeout=timeout,
                            headers={"Referer": "https://pixabay.com/"})
+                if r.status_code == 429:
+                    # Rate limited. Short backoff just burns the remaining tries, so wait
+                    # properly and say so — the caller otherwise sees a bare OSError.
+                    wait = 8 * (n + 1)
+                    if n == tries - 1:
+                        raise OSError("HTTP 429 — Pixabay is rate-limiting this machine; "
+                                      "wait a minute and retry, or use -n fewer / --pages 1")
+                    print(f"# pixabay rate-limited (429) — waiting {wait}s", file=sys.stderr)
+                    time.sleep(wait)
+                    continue
                 if r.status_code != 200:
                     raise OSError(f"HTTP {r.status_code} {url}")
                 return r.content
@@ -345,9 +355,11 @@ def pixabay(a):
 
     def detail(c):
         path, sid, title, user, likes = c
-        dl, dur, url = 0, "?", ""
+        dl, dur, url, note = 0, "?", "", ""
         try:
-            d = fetch("https://pixabay.com" + path).decode("utf-8", "replace")
+            # tries=1: under a 429 the default backoff would stall 8-24 s per card for
+            # eight cards. One quick attempt, then keep the card without its mp3.
+            d = fetch("https://pixabay.com" + path, tries=1).decode("utf-8", "replace")
             j = next(x for x in map(json.loads, re.findall(
                 r'<script type="application/ld\+json">(.*?)</script>', d, re.S))
                 if x.get("@type") == "AudioObject")
@@ -357,15 +369,19 @@ def pixabay(a):
             m = re.match(r"PT(?:(\d+)M)?(\d+)S", j.get("duration", "") or "")
             dur = f"{int(m[1] or 0) * 60 + int(m[2])}s" if m else "?"
             url = j["contentUrl"]
-        except Exception:
-            pass
+        except Exception as e:
+            note = "detail unavailable — " + str(e)[:60]
         return {"key": f"px:{sid}", "title": title, "dur": dur, "author": user,
                 "license": "Pixabay", "likes": likes, "downloads": dl,
                 "stats": f"♥{likes} ↓{dl}", "page": "https://pixabay.com" + path,
-                "preview": url, "url": url, "desc": "", "source": "pixabay"}
+                "preview": url, "url": url, "desc": note, "source": "pixabay"}
 
-    with ThreadPoolExecutor(6) as ex:
-        rows = [r for r in ex.map(detail, cards[: a.n * 2]) if r["url"]]
+    with ThreadPoolExecutor(4) as ex:
+        rows = list(ex.map(detail, cards[: a.n * 2]))
+    # Cards whose detail page failed are kept: the name and like count still tell the
+    # user whether the cue is worth opening by hand. Dropping them made the whole source
+    # look empty whenever Pixabay rate-limited us.
+    rows = [r for r in rows if r["url"]] + [r for r in rows if not r["url"]]
     rows.sort(key=lambda r: -r["likes"])
     if not rows:
         print("# pixabay: parsed 0 results — if the search page loads in a browser, its "
@@ -579,10 +595,17 @@ def search(a):
             print(f"# {name}: {e!r}", file=sys.stderr)
             buckets[name] = []
 
-    print(f"# query={a.query!r}  {'UI cue → Kenney first' if _is_ui(a.query) else 'not a UI cue → human-feedback first'}")
+    ui = _is_ui(a.query)
+    if ui and buckets.get("kenney"):
+        why = "UI cue → Kenney first"
+    elif ui:
+        why = "UI cue, but no indexed Kenney pack matched → human-feedback first"
+    else:
+        why = "not a UI cue → human-feedback first"
+    print(f"# query={a.query!r}  {why}")
     effective = [n for n in order if buckets.get(n)]
     print(f"# order: {' > '.join(effective) if effective else '(nothing returned)'}")
-    if _is_ui(a.query) and not buckets.get("kenney"):
+    if ui and not buckets.get("kenney"):
         print("# note: no indexed Kenney pack has a clip for this cue — the default packs "
               "are clicks/toggles/blips; try `kenney --packs` and `--fetch <slug>` for more")
     rows = []
@@ -694,7 +717,8 @@ def get(a):
                 except OSError:
                     pass
         else:
-            return key, None, repr(last) if last else "no download url"
+            hint = f" — open {r['page']} by hand" if r.get("page") else ""
+            return key, None, (repr(last) if last else "no download url") + hint
         lic = r.get("license", "CC0")
         return key, dst, f"credit {r.get('author', '?')}" if lic not in ("CC0", "Mixkit Free", "Pixabay") else None
 
