@@ -12,7 +12,7 @@ for UI sounds because its packs are purpose-built for interface clicks/switches.
   sfx.py kenney    "<query>"   local CC0 pack index (first run downloads ~1 MB)
   sfx.py get <dir> px:<id> fs:<id> mk:<id> kn:<path>
 """
-import argparse, html, io, json, os, platform, re, shutil, subprocess, sys, time
+import argparse, html, io, json, os, platform, re, shutil, subprocess, sys, threading, time
 import urllib.parse, urllib.request, zipfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -66,27 +66,39 @@ def _ensure_cffi(verbose=True):
         return True
     except ImportError:
         pass
-    py = _venv_python(VENV)
-    if not py.exists():
-        if verbose:
-            print("# setting up curl_cffi venv for Pixabay (one-time, ~10 s)…", file=sys.stderr)
-        try:
-            subprocess.run([sys.executable, "-m", "venv", str(VENV)], check=True,
-                           capture_output=True)
-            subprocess.run([str(py), "-m", "pip", "-q", "install", "curl_cffi"], check=True,
-                           capture_output=True)
-        except Exception as e:
+
+    # Two attempts: the second rebuilds the venv from scratch. The old code only built
+    # when the interpreter was missing, so a venv with a broken site-packages returned
+    # False forever and Pixabay stayed dead with no message.
+    for attempt in (0, 1):
+        if attempt:
             if verbose:
-                print(f"# ! curl_cffi setup failed: {e!r} — Pixabay unavailable", file=sys.stderr)
-            return False
-    for sp in list(VENV.glob("Lib/site-packages")) + list(VENV.glob("lib/python*/site-packages")):
-        if str(sp) not in sys.path:
-            sys.path.insert(0, str(sp))
-    try:
-        import curl_cffi  # noqa: F401
-        return True
-    except ImportError:
-        return False
+                print("# curl_cffi import still failing — rebuilding the venv", file=sys.stderr)
+            shutil.rmtree(VENV, ignore_errors=True)
+        py = _venv_python(VENV)
+        if not py.exists():
+            if verbose:
+                print("# setting up curl_cffi venv for Pixabay (one-time, ~10 s)…", file=sys.stderr)
+            try:
+                subprocess.run([sys.executable, "-m", "venv", str(VENV)], check=True,
+                               capture_output=True)
+                subprocess.run([str(py), "-m", "pip", "-q", "install", "curl_cffi"], check=True,
+                               capture_output=True)
+            except Exception as e:
+                if verbose:
+                    print(f"# ! curl_cffi setup failed: {e!r}", file=sys.stderr)
+                return False
+        for sp in list(VENV.glob("Lib/site-packages")) + list(VENV.glob("lib/python*/site-packages")):
+            if str(sp) not in sys.path:
+                sys.path.insert(0, str(sp))
+        try:
+            import curl_cffi  # noqa: F401
+            return True
+        except ImportError:
+            continue
+    if verbose:
+        print("# ! curl_cffi could not be imported — Pixabay unavailable", file=sys.stderr)
+    return False
 
 
 def fetch(url, timeout=60, tries=3):
@@ -110,21 +122,138 @@ def fetch(url, timeout=60, tries=3):
 
 
 def load_index():
+    """Read the search cache.
+
+    A corrupt file is moved aside rather than reported as empty. The previous version
+    returned {} here, and the next save_index() then wrote that {} plus one new row back
+    over the file — silently destroying every cached key (measured: 599 keys → 1).
+    """
     try:
         return json.loads(INDEX.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as e:
+        keep = INDEX.parent / f"{INDEX.name}.corrupt-{int(time.time())}"
+        try:
+            INDEX.replace(keep)
+            print(f"# index.json was unreadable ({e.__class__.__name__}) — kept it as "
+                  f"{keep.name}, starting a fresh cache", file=sys.stderr)
+        except OSError:
+            pass
         return {}
 
 
 def save_index(rows):
+    """Merge rows into the cache and write it atomically.
+
+    Closes two failure modes: write_text() truncates in place, so a crash mid-write
+    leaves an unreadable cache; and writing to the live path lets two concurrent
+    searches interleave. Empty input never touches the file — `kenney --packs` used to
+    call save_index([]) and rewrite the cache for no reason.
+    """
+    rows = [r for r in rows if r.get("key")]
+    if not rows:
+        return
     CACHE.mkdir(parents=True, exist_ok=True)
     idx = load_index()
     idx.update({r["key"]: r for r in rows})
-    INDEX.write_text(json.dumps(idx, ensure_ascii=False), encoding="utf-8")
+    tmp = INDEX.parent / f"{INDEX.name}.{os.getpid()}.tmp"
+    tmp.write_text(json.dumps(idx, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, INDEX)      # atomic on both Windows and POSIX
+
+
+def _parse_dur(s):
+    """'1s' / '0:01s' / '1:02:03s' / '?' → seconds (float) or None."""
+    if not s or s == "?":
+        return None
+    s = str(s).strip().rstrip("s")
+    try:
+        if ":" in s:
+            return sum(float(x) * 60 ** i for i, x in enumerate(reversed(s.split(":"))))
+        return float(s)
+    except ValueError:
+        return None
+
+
+def _find_ffprobe():
+    exe = shutil.which("ffprobe")
+    if exe:
+        return exe
+    for c in (Path("C:/Program Files/FFmpeg/bin/ffprobe.exe"),
+              Path("D:/AgentHub/_tools/hyperframes-tools/ffmpeg/ffprobe.exe"),
+              Path("/usr/bin/ffprobe"), Path("/opt/homebrew/bin/ffprobe")):
+        if c.exists():
+            return str(c)
+    return None
+
+
+def _ffprobe_dur(p):
+    """Measured duration in seconds, or None when ffprobe is unavailable.
+
+    The catalog duration is useless for short one-shots: Pixabay rounds to whole seconds
+    (a 0.575 s whoosh prints as "1s"), Mixkit rounds up ("0:01s" is really 0.452 s), and
+    Kenney has none at all. Measuring the downloaded file is the only trustworthy number.
+    """
+    exe = _find_ffprobe()
+    if not exe:
+        return None
+    try:
+        r = subprocess.run([exe, "-v", "error", "-show_entries", "format=duration",
+                            "-of", "csv=p=0", str(p)],
+                           capture_output=True, text=True, timeout=60)
+        return float(r.stdout.strip())
+    except Exception:
+        return None
+
+
+def _peak_db(p):
+    """Peak level in dBFS, or None. Positive means the file is already clipping.
+
+    Measured on real Pixabay hits: one popular whoosh peaks at +1.5 dBFS — it will
+    distort the moment it is placed in a mix, and nothing in the listing says so.
+    """
+    exe = shutil.which("ffmpeg")
+    if not exe:
+        return None
+    try:
+        r = subprocess.run([exe, "-hide_banner", "-i", str(p), "-af",
+                            "astats=metadata=1:reset=0", "-f", "null", "-"],
+                           capture_output=True, text=True, timeout=120)
+        m = re.search(r"Peak level dB:\s*(-?[\d.]+|-?inf)", r.stderr)
+        if not m or "inf" in m.group(1):
+            return None
+        return float(m.group(1))
+    except Exception:
+        return None
+
+
+def _filter_dur(rows, a):
+    """Apply --min-dur / --max-dur. Rows with an unknown duration are kept: dropping them
+    would silently hide Kenney entirely, and a wrong guess is worse than a visible '?'."""
+    lo, hi = getattr(a, "min_dur", None), getattr(a, "max_dur", None)
+    if lo is None and hi is None:
+        return rows
+    out = []
+    for r in rows:
+        d = _parse_dur(r.get("dur"))
+        if d is not None:
+            if lo is not None and d < lo:
+                continue
+            if hi is not None and d > hi:
+                continue
+        out.append(r)
+    return out
 
 
 def _fmt(rows, a, lic=False):
+    """Print rows, return how many survived the duration filter.
+
+    Everything is cached before filtering — a `--max-dur` run must not evict the long
+    clips from the index, or a later `get` on one of them fails as an unknown key.
+    """
     save_index(rows)
+    total = len(rows)
+    rows = _filter_dur(rows, a)
     for r in rows:
         cols = [r["key"], r["title"], r["dur"]]
         if "stats" in r:
@@ -137,7 +266,11 @@ def _fmt(rows, a, lic=False):
             cols.append(r["preview"])
         print("\t".join(cols))
     if not rows and not getattr(a, "packs", False):
-        print("(none)")
+        if total:
+            print(f"(none within --min-dur/--max-dur; {total} result(s) were filtered out)")
+        else:
+            print("(none)")
+    return len(rows)
 
 
 # ---------------------------------------------------------------- Freesound
@@ -147,7 +280,7 @@ def freesound(a):
     q = {"q": a.query, "s": FS_SORT[a.sort]}
     if FS_LICENSE[a.license]:
         q["f"] = "license:" + FS_LICENSE[a.license]
-    pages = range(a.page, a.page + a.pages)
+    pages = range(a.page, a.page + max(1, a.pages))
     with ThreadPoolExecutor(len(pages)) as ex:
         htmls = list(ex.map(lambda n: fetch(
             "https://freesound.org/search/?" + urllib.parse.urlencode({**q, "page": n})).decode(), pages))
@@ -172,7 +305,10 @@ def freesound(a):
                      "source": "freesound"})
     if a.sort == "relevance":
         rows.sort(key=lambda r: -r["downloads"])
-    return rows
+    if not rows:
+        print("# freesound: parsed 0 results — if the site loads fine in a browser, its "
+              "markup changed and the selectors need updating", file=sys.stderr)
+    return rows[: a.n]
 
 
 # ---------------------------------------------------------------- Pixabay
@@ -190,7 +326,7 @@ def pixabay(a):
     likes/downloads, duration and the real mp3 URL live in each page's JSON-LD.
     """
     q = urllib.parse.quote(a.query.strip())
-    pages = range(a.page, a.page + a.pages)
+    pages = range(a.page, a.page + max(1, a.pages))
     with ThreadPoolExecutor(len(pages)) as ex:
         htmls = list(ex.map(lambda n: fetch(
             f"https://pixabay.com/sound-effects/search/{q}/" + (f"?pagi={n}" if n > 1 else "")
@@ -229,9 +365,12 @@ def pixabay(a):
                 "preview": url, "url": url, "desc": "", "source": "pixabay"}
 
     with ThreadPoolExecutor(6) as ex:
-        rows = [r for r in ex.map(detail, cards[: a.n]) if r["url"]]
+        rows = [r for r in ex.map(detail, cards[: a.n * 2]) if r["url"]]
     rows.sort(key=lambda r: -r["likes"])
-    return rows
+    if not rows:
+        print("# pixabay: parsed 0 results — if the search page loads in a browser, its "
+              "markup changed (or Cloudflare is serving a challenge)", file=sys.stderr)
+    return rows[: a.n]
 
 
 # ---------------------------------------------------------------- Mixkit
@@ -268,21 +407,31 @@ def mixkit(a):
     """Scrape mixkit.co. Cards carry title + duration only — no ratings, no download counts.
 
     Mixkit's ?q= parameter returns an unrelated default list, so the keyword has to go in
-    the path (/free-sound-effects/<keyword>/). Multi-word queries are reduced to their
-    first term; on a path miss, fall back to filtering the default grid by title.
+    the path (/free-sound-effects/<keyword>/). The path takes one word, so a multi-word
+    query ("page flip") searches its first term and then filters the results by every
+    term — otherwise "card pop" came back as poker-card sounds.
     """
-    kw = re.sub(r"[^a-z0-9]+", "-", a.query.lower()).strip("-").split("-")[0]
-    if kw:
-        try:
-            rows = _mixkit_parse(fetch(f"https://mixkit.co/free-sound-effects/{kw}/").decode("utf-8", "replace"),
-                                 a.n * 3)
-            if rows:
-                return rows
-        except Exception:
-            pass
-    h = fetch("https://mixkit.co/free-sound-effects/").decode("utf-8", "replace")
     terms = [t for t in re.split(r"[^a-z0-9]+", a.query.lower()) if t]
-    return [r for r in _mixkit_parse(h, 400) if all(t in r["title"].lower() for t in terms)]
+    if not terms:
+        print("# mixkit: needs an English keyword — nothing to search", file=sys.stderr)
+        return []
+    kw = terms[0]
+    try:
+        rows = _mixkit_parse(fetch(f"https://mixkit.co/free-sound-effects/{kw}/").decode("utf-8", "replace"),
+                             a.n * 4)
+        if rows:
+            strict = [r for r in rows if all(t in r["title"].lower() for t in terms)]
+            if strict:
+                return strict[: a.n]
+            if len(terms) > 1:
+                print(f"# mixkit: nothing matches all of {terms!r}; showing the "
+                      f"'{kw}' category instead", file=sys.stderr)
+            return rows[: a.n]
+    except Exception as e:
+        print(f"# mixkit: {e!r}", file=sys.stderr)
+    h = fetch("https://mixkit.co/free-sound-effects/").decode("utf-8", "replace")
+    return [r for r in _mixkit_parse(h, 400)
+            if all(t in r["title"].lower() for t in terms)][: a.n]
 
 
 # ---------------------------------------------------------------- Kenney
@@ -314,11 +463,20 @@ def _kenney_available():
 
 def ensure_kenney(slugs=None, verbose=True):
     """Download + unpack CC0 packs once, cached under ~/.cache. Defaults to the UI packs;
-    pass slugs to pull others (impact-sounds, sci-fi-sounds, music-jingles, …)."""
+    pass slugs to pull others (impact-sounds, sci-fi-sounds, music-jingles, …).
+
+    A pack counts as done only when its `.complete` marker exists. The old test was
+    "directory non-empty", which accepted a half-extracted pack (measured: 5 of 10 clips
+    after an interrupted unzip) and never retried it.
+    """
     KENNEY.mkdir(parents=True, exist_ok=True)
     for slug in (slugs or [s for s, _ in KENNEY_PACKS]):
+        if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", slug or ""):
+            if verbose:
+                print(f"# ! refusing suspicious Kenney slug {slug!r}", file=sys.stderr)
+            continue
         dest = KENNEY / slug
-        if dest.exists() and any(dest.rglob("*.*")):
+        if (dest / ".complete").exists():
             continue
         if verbose:
             print(f"# fetching Kenney pack '{slug}' (CC0)…", file=sys.stderr)
@@ -332,7 +490,13 @@ def ensure_kenney(slugs=None, verbose=True):
             with urllib.request.urlopen(req, timeout=300) as r:
                 data = r.read()
             with zipfile.ZipFile(io.BytesIO(data)) as z:
+                # zip-slip: refuse members that resolve outside the pack directory
+                for m in z.namelist():
+                    target = (dest / m).resolve()
+                    if not str(target).startswith(str(dest.resolve())):
+                        raise OSError(f"zip member escapes pack dir: {m}")
                 z.extractall(dest)
+            (dest / ".complete").write_text("", encoding="utf-8")
         except Exception as e:
             if verbose:
                 print(f"# ! Kenney pack {slug} failed: {e!r}", file=sys.stderr)
@@ -350,10 +514,16 @@ def _kenney_files():
     return out
 
 
+def _natural(s):
+    """Sort key that keeps switch2 before switch10 (plain string order does not)."""
+    return tuple(int(x) if x.isdigit() else x for x in re.split(r"(\d+)", s.lower()))
+
+
 def kenney(a):
     if getattr(a, "packs", False):
         avail = _kenney_available()
-        got = {p.name for p in KENNEY.iterdir() if p.is_dir()} if KENNEY.exists() else set()
+        got = {p.name for p in KENNEY.iterdir()
+               if p.is_dir() and (p / ".complete").exists()} if KENNEY.exists() else set()
         print(f"# {len(avail)} audio packs on kenney.nl — ✓ = already indexed locally")
         for s in avail:
             print(("✓ " if s in got else "  ") + s)
@@ -363,17 +533,28 @@ def kenney(a):
         ensure_kenney([a.fetch])
     ensure_kenney()
     terms = [t for t in re.split(r"[^a-z0-9]+", (a.query or "").lower()) if t]
+    if (a.query or "").strip() and not terms:
+        # Kenney filenames are English only. Without this guard an all-CJK query leaves
+        # terms empty, `if terms and not score` short-circuits, and every file matches —
+        # the caller got 20 arbitrary clips back.
+        print("# kenney: pack filenames are English — this query has no ASCII token to "
+              "match, so nothing was searched. Try an English cue.", file=sys.stderr)
+        return []
     rows = []
     for p in _kenney_files():
         stem = p.stem.lower()
-        score = sum(2 if t in stem else 0 for t in terms)
-        if terms and not score:
+        hits = [t for t in terms if t in stem]
+        if terms and not hits:
             continue
+        # Rank by how many distinct query terms hit, then by how much of the name they
+        # cover. The old score let a single generic token ("click") outrank the exact
+        # noun the user asked for ("switch").
+        score = (len(hits), sum(len(t) for t in hits))
         rows.append({"key": f"kn:{p.relative_to(KENNEY).as_posix()}", "title": p.stem,
                      "dur": "?", "author": "Kenney", "license": "CC0", "preview": "",
                      "url": "", "path": str(p), "desc": f"{p.suffix.lstrip('.')} · {p.parent.name}",
                      "score": score, "source": "kenney"})
-    rows.sort(key=lambda r: (-r["score"], r["title"]))
+    rows.sort(key=lambda r: (-r["score"][0], -r["score"][1], _natural(r["title"])))
     return rows[: getattr(a, "n", 20)]
 
 
@@ -402,13 +583,16 @@ def search(a):
     effective = [n for n in order if buckets.get(n)]
     print(f"# order: {' > '.join(effective) if effective else '(nothing returned)'}")
     if _is_ui(a.query) and not buckets.get("kenney"):
-        print("# note: Kenney has no clip for this cue — its two packs are clicks/toggles/blips only")
+        print("# note: no indexed Kenney pack has a clip for this cue — the default packs "
+              "are clicks/toggles/blips; try `kenney --packs` and `--fetch <slug>` for more")
     rows = []
+    shown = {}
     for name in order:
         b = buckets.get(name) or []
         if not b:
             continue
-        print(f"\n## {name} ({len(b)})")
+        kept = _filter_dur(b, a)
+        print(f"\n## {name} ({len(kept)}" + (f" of {len(b)}" if len(kept) != len(b) else "") + ")")
         _fmt(b, a, lic=(name == "freesound" and a.license != "cc0"))
         rows += b
     if not rows:
@@ -433,7 +617,13 @@ def _to_mp3(src, dst):
 
 def get(a):
     out = Path(a.out_dir)
-    out.mkdir(parents=True, exist_ok=True)
+    try:
+        out.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        # WinError 183 here is "path exists as a file", not a network problem — the old
+        # code let it bubble up to the generic handler and print "network error".
+        sys.exit(f"cannot use {out} as an output directory: {e.strerror or e}"
+                 + (" (that path is a file)" if out.is_file() else ""))
     idx = load_index()
 
     def one(key):
@@ -442,12 +632,21 @@ def get(a):
             p = KENNEY / ref
             if not p.exists():
                 return key, None, "unknown key — run `kenney` first"
-            dst = out / f"kn_{re.sub(r'[^\w]+', '-', p.stem)}{'.mp3' if shutil.which('ffmpeg') else p.suffix}"
+            # Keep the pack name in the filename: two packs can hold the same stem
+            # (click1.ogg exists in both ui-audio and interface-sounds), and the old
+            # "kn_<stem>" silently overwrote one with the other.
+            pack = p.parent.parent.name if p.parent.name.lower() == "audio" else p.parent.name
+            dst = out / f"kn_{re.sub(r'[^\w]+', '-', pack)}_{re.sub(r'[^\w]+', '-', p.stem)}{'.mp3' if shutil.which('ffmpeg') else p.suffix}"
             if not dst.exists() and not _to_mp3(p, dst):
-                dst = out / p.name
+                dst = out / f"kn_{re.sub(r'[^\w]+', '-', pack)}_{p.name}"
                 if not dst.exists():
                     shutil.copy2(p, dst)
-            return key, dst, None if dst.suffix == ".mp3" else "raw ogg (ffmpeg not found)"
+            for stale in out.glob(f"{dst.name}*.part"):
+                try:
+                    stale.unlink()
+                except OSError:
+                    pass
+            return key, dst, None if dst.suffix == ".mp3" else "kept raw ogg — ffmpeg missing or conversion failed"
         if not sep or src_tag not in ("fs", "mk", "px"):
             return key, None, "unsupported key — use px:/fs:/mk:/kn:"
         r = idx.get(key)
@@ -457,27 +656,43 @@ def get(a):
             r = {"title": "", "license": "Mixkit Free"}
         if not r:
             return key, None, "unknown key — search first"
-        # Mixkit: always try the full WAV first, even when the cached row carries the
-        # preview mp3 — the WAV is the reason to use Mixkit at all. Fall back if absent.
+        # Mixkit: try the full WAV first, then the card's preview mp3. Some ids 403 on
+        # the WAV (measured: 788, 1143) while the preview is always served — without this
+        # fallback those clips are undownloadable even though search listed them.
         urls = []
         if src_tag == "mk":
             urls.append(f"https://assets.mixkit.co/active_storage/sfx/{ref}/{ref}.wav")
-        if r.get("url") and r["url"] not in urls:
-            urls.append(r["url"])
+            urls.append(f"https://assets.mixkit.co/active_storage/sfx/{ref}/{ref}-preview.mp3")
+        for u in (r.get("preview"), r.get("url")):
+            if u and u not in urls:
+                urls.append(u)
         slug = re.sub(r"[^\w]+", "-", r["title"]).strip("-")[:40]
         last = None
         for u in urls:
             dst = out / f"{src_tag}_{ref}{'_' + slug if slug else ''}{Path(urllib.parse.urlparse(u).path).suffix}"
             if dst.exists():
                 break
-            tmp = dst.with_suffix(dst.suffix + ".part")
+            # Unique per process+thread: two workers (or two `get` runs) on the same key
+            # used to write one .part, interleave, and land a corrupt file that
+            # dst.exists() then treated as permanently done.
+            tmp = dst.parent / f"{dst.name}.{os.getpid()}.{threading.get_ident()}.part"
             try:
                 tmp.write_bytes(fetch(u, timeout=300))
-                tmp.rename(dst)
+                os.replace(tmp, dst)
+                # Sweep leftovers: older versions used "<dst>.part", and a killed run
+                # leaves its own pid-stamped file behind. Both are dead weight now.
+                for stale in dst.parent.glob(f"{dst.name}*.part"):
+                    try:
+                        stale.unlink()
+                    except OSError:
+                        pass
                 break
             except Exception as e:
                 last = e
-                tmp.unlink(missing_ok=True)
+                try:
+                    tmp.unlink(missing_ok=True)
+                except OSError:
+                    pass
         else:
             return key, None, repr(last) if last else "no download url"
         lic = r.get("license", "CC0")
@@ -490,12 +705,46 @@ def get(a):
             return key, None, repr(e)
 
     # Freesound caps ~80 KB/s per connection, so parallelism is the only speed lever.
+    ok = 0
     with ThreadPoolExecutor(6) as ex:
         for key, dst, note in ex.map(safe, a.keys):
-            print(f"FAIL {key}: {note}" if not dst else f"{dst.name}  [{note}]" if note else dst.name)
+            if not dst:
+                print(f"FAIL {key}: {note}")
+                continue
+            ok += 1
+            # Measure what actually landed. The catalog duration is rounded to the second,
+            # so this is the only number a short cue can be judged on. Peak is measured
+            # too: a positive value means the clip clips and will distort in a mix.
+            d = _ffprobe_dur(dst)
+            dur = f"{d:.3f}s" if d is not None else "?s"
+            pk = _peak_db(dst)
+            peak = ""
+            if pk is not None:
+                peak = f"{pk:+.1f}dB" + ("  CLIPPING" if pk > -0.1 else "")
+            cols = [dst.name, dur] + ([peak] if peak else []) + ([f"[{note}]"] if note else [])
+            print("\t".join(cols))
+    if not ok:
+        sys.exit(1)      # every key failed — do not report success
 
 
 # ---------------------------------------------------------------- cli
+
+def _utf8_stdio():
+    """Force UTF-8 on stdout/stderr before anything prints.
+
+    Windows consoles default to cp936/gbk here, and the module docstring — which argparse
+    echoes for --help — contains ♥ ↓ ★ →. Doing this after parse_args() was too late:
+    `sfx.py --help` died with UnicodeEncodeError before the fix ever ran.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
+_utf8_stdio()
+
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -505,6 +754,11 @@ def main():
         p.add_argument("query")
         p.add_argument("-n", type=int, default=8)
         p.add_argument("--urls", action="store_true")
+        p.add_argument("--min-dur", type=float, metavar="SEC",
+                       help="drop results shorter than this (unknown durations are kept)")
+        p.add_argument("--max-dur", type=float, metavar="SEC",
+                       help="drop results longer than this — the fix for a 0.2s cue "
+                            "returning a 55s loop")
 
     s = sp.add_parser("search"); common(s)
     s.add_argument("--license", choices=FS_LICENSE, default="any"); s.set_defaults(fn=search)
@@ -527,6 +781,8 @@ def main():
     k.add_argument("query", nargs="?", default="")
     k.add_argument("-n", type=int, default=20)
     k.add_argument("--urls", action="store_true")
+    k.add_argument("--min-dur", type=float, metavar="SEC")
+    k.add_argument("--max-dur", type=float, metavar="SEC")
     k.add_argument("--packs", action="store_true", help="list every Kenney audio pack and which are indexed")
     k.add_argument("--fetch", metavar="SLUG", help="download one more CC0 pack, then search it")
     k.set_defaults(fn=lambda a: _fmt(kenney(a), a))
@@ -534,18 +790,19 @@ def main():
     g = sp.add_parser("get"); g.add_argument("out_dir"); g.add_argument("keys", nargs="+"); g.set_defaults(fn=get)
 
     a = ap.parse_args()
-    # Windows consoles default to cp936 here, which turns ↓ ★ ♥ → into mojibake.
-    for stream in (sys.stdout, sys.stderr):
-        try:
-            stream.reconfigure(encoding="utf-8")
-        except Exception:
-            pass
     if a.cmd in ("pixabay", "search") or (a.cmd == "get" and any(k.startswith("px:") for k in a.keys)):
         _ensure_cffi()
     try:
         a.fn(a)
+    except KeyboardInterrupt:
+        sys.exit(130)
     except OSError as e:
         sys.exit(f"network error: {getattr(e, 'reason', e)}")
+    except Exception as e:
+        # A raw traceback tells a non-programmer nothing; SFX_DEBUG=1 brings it back.
+        if os.environ.get("SFX_DEBUG"):
+            raise
+        sys.exit(f"{e.__class__.__name__}: {e}")
 
 
 if __name__ == "__main__":

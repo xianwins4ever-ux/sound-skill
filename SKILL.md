@@ -8,6 +8,7 @@ You can't hear these clips, so lean on what people who *did* hear them left behi
 ```
 S=$HOME/.agents/skills/sound/scripts/sfx.py
 python $S search "<query>"        # all four sources, ranked for the cue
+python $S search "<query>" --max-dur 0.8   # short one-shots only (card pops, clicks)
 python $S pixabay "<query>"       # ♥likes ↓downloads (largest catalog, no credit needed)
 python $S freesound "<query>"     # ↓downloads ★rating(votes) license description
 python $S mixkit "<query>"        # title + duration only
@@ -19,6 +20,8 @@ python $S get <dir> px:<id> fs:<id> mk:<id> kn:<path>   # parallel download
 
 `--urls` on any search adds preview links so the user can audition.
 
+**`get` prints the measured duration and peak level of every file it saves.** Trust those numbers, not the ones in the search listing — see "Durations lie" below. A peak above `-0.1 dB` is flagged `CLIPPING`: the clip already distorts at unity gain and will sound worse once placed in a mix (measured on a popular Pixabay whoosh: `+1.5dB CLIPPING`).
+
 ## Which library first
 
 Not a preference — it changes the result. Measured on the same 7-second product animation (title fly-in, four cards, a switch toggle, a page flip, a logo land), two skills differing *only* in search order were compared blind. The order below won:
@@ -27,7 +30,24 @@ Not a preference — it changes the result. Measured on the same 7-second produc
 2. **Then Mixkit** — decent sourcing, but a title and a duration is thin evidence.
 3. **Kenney last** — except for UI.
 
-**The exception: UI sounds go to Kenney first.** On the same test the one clip that lost was the switch toggle: the Freesound pick was a real (torch) switch, well-rated, but Kenney's purpose-built UI pack beat it. `search` already applies this rule automatically — a cue containing click / switch / button / pop / toggle / ui / rollover / select / menu / tap / hover / tick / beep / notification / alert routes Kenney first; everything else routes Pixabay first. It prints the order it chose and why, so you can cite that.
+**The exception: UI sounds go to Kenney first.** On the same test the one clip that lost was the switch toggle: the Freesound pick was a real (torch) switch, well-rated, but Kenney's purpose-built UI pack beat it. `search` already applies this rule automatically — a cue containing click / switch / button / pop / toggle / ui / rollover / hover / select / menu / tap / tick / beep / cursor / notification / alert / confirm / error / success / check / back / close / drop / bong / glitch / blip routes Kenney first; everything else routes Pixabay first. It prints the order it chose and why, so you can cite that.
+
+Note the list is deliberately narrow. It holds *interface* cues only. Transition cues — whoosh, slide, swipe, riser — are **not** in it, because Kenney's packs contain no such clips: routing them to Kenney just returns nothing and wastes a round trip.
+
+## Durations lie
+
+Every catalog rounds, and the rounding is large enough to make a short cue unjudgeable:
+
+| Source | What it prints | Measured | Error |
+|---|---|---|---|
+| Pixabay | `1s` | 0.552 s | −45% |
+| Pixabay | `1s` | 1.200 s | +20% |
+| Mixkit | `0:01s` | 0.452 s | −55% |
+| Kenney | `?` | — | none at all |
+
+So: **never pick a sub-second clip from the listing.** Either run `get` and read the measured duration it prints, or narrow the search with `--max-dur` and let the filter do the first pass. `--min-dur` / `--max-dur` are applied to the printed view only — every result is still cached, so a filtered-out clip can still be downloaded by key afterwards.
+
+Ranking is another trap: all four sources sort by popularity, and popularity is an *inverse* signal for short one-shots — a 55-second paper-rustle loop out-likes the 0.45-second page turn you actually want. Combine `--max-dur` with a popularity-sorted list and you get the usable short clips with the crowd's endorsement on top.
 
 ## Reading the signals
 
@@ -39,9 +59,13 @@ Not a preference — it changes the result. Measured on the same 7-second produc
 
 ## Practical notes
 
-- **Formats differ by source, and it matters.** Mixkit downloads the full `.wav` (the card only advertises an mp3 preview — the script swaps in the WAV path). Kenney ships `.ogg`, which most editors refuse, so `get` converts to `.mp3` with ffmpeg automatically; without ffmpeg on PATH it keeps the raw `.ogg` and says so. Pixabay and Freesound give mp3.
+- **Formats differ by source, and it matters.** Mixkit tries the full `.wav` first and falls back to the card's preview mp3 — some ids answer 403 on the WAV while the preview is always served, so without the fallback those clips look downloadable and then fail. Kenney ships `.ogg`, which most editors refuse, so `get` converts to `.mp3` with ffmpeg automatically; without ffmpeg on PATH it keeps the raw `.ogg` and says so. Pixabay and Freesound give mp3.
+- Kenney downloads keep the pack name in the filename (`kn_ui-audio_click1.mp3`). Two packs ship the same stem, and the old `kn_<stem>` form let one silently overwrite the other.
 - Freesound caps ~80 KB/s per connection, so put every key in one `get` — it downloads in parallel (6 workers).
 - **Pixabay sits behind Cloudflare.** A plain request gets "Just a moment…" (HTTP 403), so the script impersonates Chrome's TLS fingerprint through `curl_cffi`, installed once into `~/.cache/sfx-sources/venv` on the first Pixabay call (~10 s). Nothing global is touched. If it starts returning 403 anyway, Cloudflare tightened — fall back to reading the search page by hand.
-- Kenney packs are fetched once into `~/.cache/sfx-sources/kenney/` and re-indexed from disk afterwards, so repeat searches are instant and offline. Only the two UI packs come by default; Kenney publishes ten audio packs — `kenney --packs` lists them (impact-sounds, sci-fi-sounds, music-jingles, rpg-audio, casino-audio, digital-audio, two voiceover packs), and `--fetch <slug>` pulls one in. Worth doing when the cue is impacts, sci-fi, or game audio: those packs are CC0, purpose-built, and consistent as a set.
+- Kenney packs are fetched once into `~/.cache/sfx-sources/kenney/` and re-indexed from disk afterwards, so repeat searches are instant and offline. A pack counts as installed only when its `.complete` marker exists, so an interrupted unzip is retried instead of being silently accepted as done. Only the two UI packs come by default; Kenney publishes ten audio packs — `kenney --packs` lists them (impact-sounds, sci-fi-sounds, music-jingles, rpg-audio, casino-audio, digital-audio, two voiceover packs), and `--fetch <slug>` pulls one in. Worth doing when the cue is impacts, sci-fi, or game audio: those packs are CC0, purpose-built, and consistent as a set.
+- **Kenney filenames are English.** An all-CJK query matches nothing, and the script says so rather than returning arbitrary files. Translate the cue before searching that source.
+- **License check before commercial use.** Freesound's default filter is `any`, which can return BY-NC — not usable commercially. Use `--license by` (CC0 + Attribution) or `--license cc0` when the output is going into paid work. Pixabay needs no credit, Kenney is CC0, Mixkit is free to use.
 - Freesound and Pixabay both work over a direct connection here; no proxy is required. `clash_freesound.py` is macOS/ClashX-only and does nothing on Windows — skip it.
-- On Windows the console defaults to cp936, which mangles ♥ ↓ ★ →; the script reconfigures stdout to UTF-8 so the tables read correctly.
+- On Windows the console defaults to cp936, which mangles ♥ ↓ ★ →; the script reconfigures stdout to UTF-8 at import time, before argparse can print `--help`, which used to die on the ♥ in this file's own docstring.
+- **When a source returns nothing, check whether it actually failed.** A parse that matches zero cards prints a warning to stderr instead of returning a silent empty list, so "no results" and "the site changed its markup" are distinguishable. If a source that normally works suddenly returns nothing, suspect the site, not the query.
