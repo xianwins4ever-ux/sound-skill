@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
-"""Multi-source SFX search & download (stdlib only).
+"""Multi-source SFX search & download (stdlib only, plus curl_cffi for Pixabay).
 
 Ranking follows the workflow this skill documents: libraries that carry human
-feedback (downloads, ratings, descriptions) come first, but Kenney wins for UI
-sounds because its packs are purpose-built for interface clicks/switches.
+feedback (likes, downloads, ratings, descriptions) come first, but Kenney wins
+for UI sounds because its packs are purpose-built for interface clicks/switches.
 
   sfx.py search    "<query>"   aggregate every source, ranked
+  sfx.py pixabay   "<query>"   ♥likes ↓downloads (Cloudflare → curl_cffi venv)
   sfx.py freesound "<query>"   ↓downloads ★rating(votes) description
   sfx.py mixkit    "<query>"   title + duration only (no human feedback)
   sfx.py kenney    "<query>"   local CC0 pack index (first run downloads ~1 MB)
-  sfx.py get <dir> fs:<id> mk:<id> kn:<path>
+  sfx.py get <dir> px:<id> fs:<id> mk:<id> kn:<path>
 """
-import argparse, html, io, json, re, shutil, subprocess, sys, time
+import argparse, html, io, json, os, platform, re, shutil, subprocess, sys, time
 import urllib.parse, urllib.request, zipfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -22,6 +23,7 @@ UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.3
 CACHE = Path.home() / ".cache" / "sfx-sources"
 INDEX = CACHE / "index.json"          # search results, so `get` knows title + download url
 KENNEY = CACHE / "kenney"            # unpacked CC0 packs
+VENV = CACHE / "venv"                # curl_cffi venv (Pixabay sits behind Cloudflare)
 
 FS_LICENSE = {"cc0": '"Creative Commons 0"', "by": '("Attribution" OR "Creative Commons 0")', "any": None}
 FS_LIC_SHORT = {"Creative Commons 0": "CC0", "Attribution": "BY",
@@ -34,20 +36,77 @@ FS_SORT = {"downloads": "Downloads (most first)", "rating": "Rating (highest fir
 KENNEY_PACKS = [("ui-audio", "UI audio"), ("interface-sounds", "Interface sounds")]
 
 # Cues where Kenney outranks a human-feedback library: purpose-built interface audio.
-UI_HINTS = {"click", "clicks", "switch", "button", "pop", "popup", "toggle", "ui", "interface",
-            "rollover", "hover", "select", "selection", "menu", "tap", "tick", "beep", "cursor",
-            "notification", "confirm", "error", "success", "check", "tick", "slide", "whoosh"}
+# Deliberately narrow — the two bundled packs are clicks/toggles/blips only, so a
+# transition cue like "whoosh" or "slide" must NOT route here (it would find nothing).
+UI_HINTS = {"click", "clicks", "switch", "switches", "button", "buttons", "pop", "popup",
+            "toggle", "ui", "interface", "rollover", "hover", "select", "selection", "menu",
+            "tap", "tick", "beep", "cursor", "notification", "alert", "confirm", "confirmation",
+            "error", "success", "check", "back", "close", "drop", "bong", "glitch", "blip"}
+
+
+def _venv_python(venv):
+    return venv / ("Scripts/python.exe" if platform.system() == "Windows" else "bin/python")
+
+
+def _ensure_cffi(verbose=True):
+    """Make `curl_cffi` importable, building a private venv on first use.
+
+    Pixabay answers plain urllib with a Cloudflare 403 ("Just a moment…"), so its
+    requests have to look like a real browser. curl_cffi does that by impersonating
+    Chrome's TLS fingerprint.
+
+    Two portability traps this avoids, both of which break the upstream script on
+    Windows: the venv interpreter is Scripts/python.exe there, not bin/python; and
+    re-exec'ing the script under the venv (os.execv) loses the caller's cwd and
+    quoting. Instead the venv's site-packages is appended to sys.path and imported
+    in-process — same interpreter version, so the compiled extension loads fine.
+    """
+    try:
+        import curl_cffi  # noqa: F401
+        return True
+    except ImportError:
+        pass
+    py = _venv_python(VENV)
+    if not py.exists():
+        if verbose:
+            print("# setting up curl_cffi venv for Pixabay (one-time, ~10 s)…", file=sys.stderr)
+        try:
+            subprocess.run([sys.executable, "-m", "venv", str(VENV)], check=True,
+                           capture_output=True)
+            subprocess.run([str(py), "-m", "pip", "-q", "install", "curl_cffi"], check=True,
+                           capture_output=True)
+        except Exception as e:
+            if verbose:
+                print(f"# ! curl_cffi setup failed: {e!r} — Pixabay unavailable", file=sys.stderr)
+            return False
+    for sp in list(VENV.glob("Lib/site-packages")) + list(VENV.glob("lib/python*/site-packages")):
+        if str(sp) not in sys.path:
+            sys.path.insert(0, str(sp))
+    try:
+        import curl_cffi  # noqa: F401
+        return True
+    except ImportError:
+        return False
 
 
 def fetch(url, timeout=60, tries=3):
     for n in range(tries):
         try:
+            if "pixabay.com" in url:      # Cloudflare 403s plain urllib; cdn.* is routed too
+                if not _ensure_cffi():
+                    raise OSError("Pixabay needs curl_cffi, which could not be installed")
+                from curl_cffi import requests as cr
+                r = cr.get(url, impersonate="chrome", timeout=timeout,
+                           headers={"Referer": "https://pixabay.com/"})
+                if r.status_code != 200:
+                    raise OSError(f"HTTP {r.status_code} {url}")
+                return r.content
             with urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=timeout) as r:
                 return r.read()
         except Exception as e:
             if n == tries - 1:
                 raise e if isinstance(e, OSError) else OSError(repr(e))
-            time.sleep(1 + n)
+            time.sleep(1 + n)   # Cloudflare 403s are sporadic; a short pause usually clears them
 
 
 def load_index():
@@ -77,7 +136,7 @@ def _fmt(rows, a, lic=False):
         if a.urls:
             cols.append(r["preview"])
         print("\t".join(cols))
-    if not rows:
+    if not rows and not getattr(a, "packs", False):
         print("(none)")
 
 
@@ -116,6 +175,65 @@ def freesound(a):
     return rows
 
 
+# ---------------------------------------------------------------- Pixabay
+
+def k_num(t):  # "2.4K" -> 2400
+    m = re.match(r"([\d.]+)\s*([KM]?)", t or "")
+    return int(float(m[1]) * {"": 1, "K": 1e3, "M": 1e6}[m[2]]) if m else 0
+
+
+def pixabay(a):
+    """Scrape pixabay.com/sound-effects. Largest free catalog, no attribution required.
+
+    Pixabay cannot sort by likes server-side, so pull several relevance pages, rank the
+    cards by their rounded like counter, then open only the top n detail pages — exact
+    likes/downloads, duration and the real mp3 URL live in each page's JSON-LD.
+    """
+    q = urllib.parse.quote(a.query.strip())
+    pages = range(a.page, a.page + a.pages)
+    with ThreadPoolExecutor(len(pages)) as ex:
+        htmls = list(ex.map(lambda n: fetch(
+            f"https://pixabay.com/sound-effects/search/{q}/" + (f"?pagi={n}" if n > 1 else "")
+        ).decode("utf-8", "replace"), pages))
+    seen, cards = set(), []
+    for h in htmls:
+        for blk in h.split('<div class="nameAndTitle')[1:]:
+            t = re.search(r'<a href="(/sound-effects/[^"]*?-(\d+)/)" class="title[^"]*">(.*?)</a>'
+                          r'<a href="/users/[^"]*" class="name[^"]*">(.*?)</a>', blk)
+            if t and t[2] not in seen:
+                seen.add(t[2])
+                cnt = re.search(r'counter="([^"]*)"', blk)
+                cards.append((t[1], t[2], html.unescape(t[3]), html.unescape(t[4]),
+                              k_num(cnt[1] if cnt else "")))
+    cards.sort(key=lambda c: -c[4])
+
+    def detail(c):
+        path, sid, title, user, likes = c
+        dl, dur, url = 0, "?", ""
+        try:
+            d = fetch("https://pixabay.com" + path).decode("utf-8", "replace")
+            j = next(x for x in map(json.loads, re.findall(
+                r'<script type="application/ld\+json">(.*?)</script>', d, re.S))
+                if x.get("@type") == "AudioObject")
+            st = {i["interactionType"].rsplit("/", 1)[-1]: i["userInteractionCount"]
+                  for i in j.get("interactionStatistic", [])}
+            likes, dl = st.get("LikeAction", likes), st.get("DownloadAction", 0)
+            m = re.match(r"PT(?:(\d+)M)?(\d+)S", j.get("duration", "") or "")
+            dur = f"{int(m[1] or 0) * 60 + int(m[2])}s" if m else "?"
+            url = j["contentUrl"]
+        except Exception:
+            pass
+        return {"key": f"px:{sid}", "title": title, "dur": dur, "author": user,
+                "license": "Pixabay", "likes": likes, "downloads": dl,
+                "stats": f"♥{likes} ↓{dl}", "page": "https://pixabay.com" + path,
+                "preview": url, "url": url, "desc": "", "source": "pixabay"}
+
+    with ThreadPoolExecutor(6) as ex:
+        rows = [r for r in ex.map(detail, cards[: a.n]) if r["url"]]
+    rows.sort(key=lambda r: -r["likes"])
+    return rows
+
+
 # ---------------------------------------------------------------- Mixkit
 
 MK_CARD = 'class="item-grid-card item-grid-card--show-meta"'
@@ -133,7 +251,13 @@ def _mixkit_parse(h, limit):
         rows.append({"key": f"mk:{sid.group(1)}",
                      "title": html.unescape(re.sub(r"<[^>]+>", "", title.group(1))).strip(),
                      "dur": (dur.group(1) + "s") if dur else "?", "author": "Mixkit",
-                     "license": "Mixkit Free", "preview": mp3.group(1), "url": mp3.group(1),
+                     "license": "Mixkit Free", "preview": mp3.group(1),
+                     # the card only advertises the mp3 preview; Mixkit also serves the full
+                     # WAV at a predictable path, which is what we actually want in an edit.
+                     "wav": f"https://assets.mixkit.co/active_storage/sfx/{sid.group(1)}/"
+                            f"{sid.group(1)}.wav",
+                     "url": f"https://assets.mixkit.co/active_storage/sfx/{sid.group(1)}/"
+                            f"{sid.group(1)}.wav",
                      "desc": "", "source": "mixkit"})
         if len(rows) >= limit:
             break
@@ -177,15 +301,27 @@ def _kenney_zip(slug):
     return j.get("url")
 
 
-def ensure_kenney(verbose=True):
-    """Download + unpack the CC0 packs once. ~1 MB total, cached under ~/.cache."""
+def _kenney_available():
+    """Every audio pack Kenney publishes. The category page needs a browser UA — a bare
+    request gets 403. Values are slugs; the download id is just hex('assets/<slug>')."""
+    try:
+        h = fetch("https://kenney.nl/assets/category:Audio").decode("utf-8", "replace")
+    except Exception:
+        return []
+    junk = {"category", "series", "tag"}
+    return sorted({s for s in re.findall(r"kenney\.nl/assets/([a-z0-9-]+)", h) if s not in junk})
+
+
+def ensure_kenney(slugs=None, verbose=True):
+    """Download + unpack CC0 packs once, cached under ~/.cache. Defaults to the UI packs;
+    pass slugs to pull others (impact-sounds, sci-fi-sounds, music-jingles, …)."""
     KENNEY.mkdir(parents=True, exist_ok=True)
-    for slug, label in KENNEY_PACKS:
+    for slug in (slugs or [s for s, _ in KENNEY_PACKS]):
         dest = KENNEY / slug
         if dest.exists() and any(dest.rglob("*.*")):
             continue
         if verbose:
-            print(f"# fetching Kenney pack '{label}' (CC0)…", file=sys.stderr)
+            print(f"# fetching Kenney pack '{slug}' (CC0)…", file=sys.stderr)
         u = _kenney_zip(slug)
         if not u:
             if verbose:
@@ -193,7 +329,7 @@ def ensure_kenney(verbose=True):
             continue
         try:
             req = urllib.request.Request(u, headers={**UA, "Referer": f"https://kenney.nl/assets/{slug}"})
-            with urllib.request.urlopen(req, timeout=180) as r:
+            with urllib.request.urlopen(req, timeout=300) as r:
                 data = r.read()
             with zipfile.ZipFile(io.BytesIO(data)) as z:
                 z.extractall(dest)
@@ -205,17 +341,28 @@ def ensure_kenney(verbose=True):
 
 def _kenney_files():
     exts = {".ogg", ".wav", ".mp3", ".m4a", ".flac"}
+    skip = {"preview"}          # each pack ships a Preview.ogg montage, not a usable clip
     out = []
     if KENNEY.exists():
         for p in KENNEY.rglob("*"):
-            if p.is_file() and p.suffix.lower() in exts:
+            if p.is_file() and p.suffix.lower() in exts and p.stem.lower() not in skip:
                 out.append(p)
     return out
 
 
 def kenney(a):
+    if getattr(a, "packs", False):
+        avail = _kenney_available()
+        got = {p.name for p in KENNEY.iterdir() if p.is_dir()} if KENNEY.exists() else set()
+        print(f"# {len(avail)} audio packs on kenney.nl — ✓ = already indexed locally")
+        for s in avail:
+            print(("✓ " if s in got else "  ") + s)
+        print("# add one with: kenney --fetch <slug>", file=sys.stderr)
+        return []
+    if getattr(a, "fetch", None):
+        ensure_kenney([a.fetch])
     ensure_kenney()
-    terms = [t for t in re.split(r"[^a-z0-9]+", a.query.lower()) if t]
+    terms = [t for t in re.split(r"[^a-z0-9]+", (a.query or "").lower()) if t]
     rows = []
     for p in _kenney_files():
         stem = p.stem.lower()
@@ -227,7 +374,7 @@ def kenney(a):
                      "url": "", "path": str(p), "desc": f"{p.suffix.lstrip('.')} · {p.parent.name}",
                      "score": score, "source": "kenney"})
     rows.sort(key=lambda r: (-r["score"], r["title"]))
-    return rows
+    return rows[: getattr(a, "n", 20)]
 
 
 # ---------------------------------------------------------------- aggregate
@@ -238,19 +385,24 @@ def _is_ui(query):
 
 def search(a):
     """Run every source, then rank the way the documented workflow says."""
-    order = ["kenney", "freesound", "mixkit"] if _is_ui(a.query) else ["freesound", "mixkit", "kenney"]
+    order = (["kenney", "pixabay", "freesound", "mixkit"] if _is_ui(a.query)
+             else ["pixabay", "freesound", "mixkit", "kenney"])
     a_sort = argparse.Namespace(**{**vars(a), "sort": "relevance", "pages": 2, "page": 1,
                                    "license": a.license, "n": a.n, "urls": a.urls})
+    fns = {"kenney": kenney, "pixabay": pixabay, "freesound": freesound, "mixkit": mixkit}
     buckets = {}
     for name in order:
         try:
-            buckets[name] = (kenney if name == "kenney" else freesound if name == "freesound" else mixkit)(a_sort)[: a.n]
+            buckets[name] = fns[name](a_sort)[: a.n]
         except Exception as e:
             print(f"# {name}: {e!r}", file=sys.stderr)
             buckets[name] = []
 
     print(f"# query={a.query!r}  {'UI cue → Kenney first' if _is_ui(a.query) else 'not a UI cue → human-feedback first'}")
-    print(f"# order: {' > '.join(order)}")
+    effective = [n for n in order if buckets.get(n)]
+    print(f"# order: {' > '.join(effective) if effective else '(nothing returned)'}")
+    if _is_ui(a.query) and not buckets.get("kenney"):
+        print("# note: Kenney has no clip for this cue — its two packs are clicks/toggles/blips only")
     rows = []
     for name in order:
         b = buckets.get(name) or []
@@ -296,19 +448,40 @@ def get(a):
                 if not dst.exists():
                     shutil.copy2(p, dst)
             return key, dst, None if dst.suffix == ".mp3" else "raw ogg (ffmpeg not found)"
-        if not sep or src_tag not in ("fs", "mk"):
-            return key, None, "unsupported key — use fs:/mk:/kn:"
+        if not sep or src_tag not in ("fs", "mk", "px"):
+            return key, None, "unsupported key — use px:/fs:/mk:/kn:"
         r = idx.get(key)
+        if not r and src_tag == "mk":
+            # Mixkit serves every clip at a predictable path, so an id from a previous
+            # session still downloads without re-running the search.
+            r = {"title": "", "license": "Mixkit Free"}
         if not r:
             return key, None, "unknown key — search first"
+        # Mixkit: always try the full WAV first, even when the cached row carries the
+        # preview mp3 — the WAV is the reason to use Mixkit at all. Fall back if absent.
+        urls = []
+        if src_tag == "mk":
+            urls.append(f"https://assets.mixkit.co/active_storage/sfx/{ref}/{ref}.wav")
+        if r.get("url") and r["url"] not in urls:
+            urls.append(r["url"])
         slug = re.sub(r"[^\w]+", "-", r["title"]).strip("-")[:40]
-        dst = out / f"{src_tag}_{ref}{'_' + slug if slug else ''}{Path(urllib.parse.urlparse(r['url']).path).suffix}"
-        if not dst.exists():
+        last = None
+        for u in urls:
+            dst = out / f"{src_tag}_{ref}{'_' + slug if slug else ''}{Path(urllib.parse.urlparse(u).path).suffix}"
+            if dst.exists():
+                break
             tmp = dst.with_suffix(dst.suffix + ".part")
-            tmp.write_bytes(fetch(r["url"], timeout=300))
-            tmp.rename(dst)
+            try:
+                tmp.write_bytes(fetch(u, timeout=300))
+                tmp.rename(dst)
+                break
+            except Exception as e:
+                last = e
+                tmp.unlink(missing_ok=True)
+        else:
+            return key, None, repr(last) if last else "no download url"
         lic = r.get("license", "CC0")
-        return key, dst, f"credit {r.get('author', '?')}" if lic not in ("CC0", "Mixkit Free") else None
+        return key, dst, f"credit {r.get('author', '?')}" if lic not in ("CC0", "Mixkit Free", "Pixabay") else None
 
     def safe(key):
         try:
@@ -336,6 +509,11 @@ def main():
     s = sp.add_parser("search"); common(s)
     s.add_argument("--license", choices=FS_LICENSE, default="any"); s.set_defaults(fn=search)
 
+    x = sp.add_parser("pixabay"); common(x)
+    x.add_argument("-p", "--page", type=int, default=1)
+    x.add_argument("--pages", type=int, default=3, help="relevance pages (20 each) to rank by likes")
+    x.set_defaults(fn=lambda a: _fmt(pixabay(a), a))
+
     f = sp.add_parser("freesound"); common(f)
     f.add_argument("--license", choices=FS_LICENSE, default="any")
     f.add_argument("--sort", choices=FS_SORT, default="relevance")
@@ -344,11 +522,26 @@ def main():
     f.set_defaults(fn=lambda a: _fmt(freesound(a), a, lic=a.license != "cc0"))
 
     m = sp.add_parser("mixkit"); common(m); m.set_defaults(fn=lambda a: _fmt(mixkit(a), a))
-    k = sp.add_parser("kenney"); common(k); k.set_defaults(fn=lambda a: _fmt(kenney(a), a))
+
+    k = sp.add_parser("kenney")
+    k.add_argument("query", nargs="?", default="")
+    k.add_argument("-n", type=int, default=20)
+    k.add_argument("--urls", action="store_true")
+    k.add_argument("--packs", action="store_true", help="list every Kenney audio pack and which are indexed")
+    k.add_argument("--fetch", metavar="SLUG", help="download one more CC0 pack, then search it")
+    k.set_defaults(fn=lambda a: _fmt(kenney(a), a))
 
     g = sp.add_parser("get"); g.add_argument("out_dir"); g.add_argument("keys", nargs="+"); g.set_defaults(fn=get)
 
     a = ap.parse_args()
+    # Windows consoles default to cp936 here, which turns ↓ ★ ♥ → into mojibake.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8")
+        except Exception:
+            pass
+    if a.cmd in ("pixabay", "search") or (a.cmd == "get" and any(k.startswith("px:") for k in a.keys)):
+        _ensure_cffi()
     try:
         a.fn(a)
     except OSError as e:
