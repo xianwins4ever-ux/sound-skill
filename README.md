@@ -6,7 +6,7 @@
 
 vibe-motion 的 Sound Skill 付费版卖三件事：更多来源的音效、生成背景音乐、混音。这三件事的能力，作者本人都已在个人账号公开实现——只是分散在三个仓库里，而且只在他的 macOS 环境跑得通。
 
-本仓库做的是把其中最常用的**音效检索**整合成一个能直接用的 skill，补齐 Windows 支持，并修掉 25 个 bug。
+本仓库做的是把其中最常用的**音效检索**整合成一个能直接用的 skill，补齐 Windows 支持，并修掉 27 个 bug。
 
 - 四源检索：[sxhzju/sound](https://github.com/sxhzju/sound)（作者个人号，bio 写明 `->@vibe-motion`）
 - 音乐生成：[sxhzju/sound/procedural-audio](https://github.com/sxhzju/sound/tree/main/procedural-audio)
@@ -60,7 +60,7 @@ mk_1492_Cinematic-whoosh-fast-transition.wav   1.334s  -0.5dB
 
 峰值超过 `-0.1dB` 会标 `CLIPPING`。实测有个热门 Pixabay whoosh 是 `+1.5dB CLIPPING`——列表里完全看不出来，丢进混音就爆。
 
-## 修的 25 个 bug
+## 修的 27 个 bug
 
 原版在 Windows 上基本跑不起来。这些是实测出来的，不是猜的。
 
@@ -87,6 +87,10 @@ mk_1492_Cinematic-whoosh-fast-transition.wav   1.334s  -0.5dB
 **安全问题**
 
 - `kn:` 键可以路径穿越，`kn:../../../.gitconfig` 能把任意文件复制出来
+
+**下载失败**
+
+- Freesound 的 CDN 拒绝 Python `urllib` 的默认 TLS 握手。同一条 URL，curl 和浏览器返回 200，Python 返回 403——响应头 `Content-Length: 0`，没有任何错误信息。不处理的话 Freesound 下载在普通环境下 100% 失败
 
 完整清单和每条的实测证据在提交记录里。
 
