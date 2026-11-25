@@ -1,12 +1,13 @@
 ---
 name: sound
 description: Find and download sound effects for videos from Pixabay, Freesound, Mixkit and Kenney, ranking by human feedback with Kenney promoted for UI sounds.
-allowed-tools: Bash(python $HOME/.agents/skills/sound/scripts/*)
+allowed-tools: Bash(python */scripts/sfx.py*)
 ---
 You can't hear these clips, so lean on what people who *did* hear them left behind: likes, download counts, ratings, vote counts, and the uploader's own description. Mixkit gives a title and a duration; Kenney gives only a filename, so judge that by name alone.
 
 ```
-S=$HOME/.agents/skills/sound/scripts/sfx.py
+# $S is sfx.py inside this skill directory. Resolve it once, then reuse it:
+S="${CLAUDE_SKILL_DIR:-$HOME/.agents/skills/sound}/scripts/sfx.py"
 python $S search "<query>"        # all four sources, ranked for the cue
 python $S search "<query>" --max-dur 0.8   # short one-shots only (card pops, clicks)
 python $S pixabay "<query>"       # ♥likes ↓downloads (largest catalog, no credit needed)
@@ -17,6 +18,8 @@ python $S kenney --packs          # list all 10 Kenney audio packs, ✓ = alread
 python $S kenney "<query>" --fetch impact-sounds   # pull another CC0 pack, then search it
 python $S get <dir> px:<id> fs:<id> mk:<id> kn:<path>   # parallel download
 ```
+
+If the skill lives somewhere other than `~/.agents/skills/sound`, set `S` to that path instead — the commands are the same.
 
 `--urls` on any search adds preview links so the user can audition.
 

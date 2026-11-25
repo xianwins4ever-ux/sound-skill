@@ -101,7 +101,9 @@ git clone https://github.com/xianwins4ever-ux/sound-skill.git ~/.agents/skills/s
 ## 用法
 
 ```bash
+# 装在 ~/.agents/skills/sound（上面的安装命令就是这个位置）
 S=~/.agents/skills/sound/scripts/sfx.py
+# 装在别处就把这行换成实际路径，命令都一样
 
 # 四源并排，按画面动作自动决定优先级
 python $S search "soft whoosh" -n 3 --urls
