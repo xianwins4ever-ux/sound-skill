@@ -116,14 +116,24 @@ def _ensure_cffi(verbose=True):
 
 
 def fetch(url, timeout=60, tries=3):
+    """GET a URL, using a browser-shaped TLS fingerprint where the host demands one.
+
+    Cloudflare (Pixabay) and Freesound's CDN both reject Python's default TLS handshake:
+    plain urllib gets 403 on a URL that curl and every browser fetch fine — verified by
+    comparing the same CDN URL across curl, Chrome-UA urllib, and curl_cffi. So the hosts
+    that do this go through curl_cffi, and everything else uses stdlib.
+    """
+    needs_cffi = any(h in url for h in ("pixabay.com", "cdn.freesound.org", "freesound.org"))
     for n in range(tries):
         try:
-            if "pixabay.com" in url:      # Cloudflare 403s plain urllib; cdn.* is routed too
+            if needs_cffi:
                 if not _ensure_cffi():
-                    raise OSError("Pixabay needs curl_cffi, which could not be installed")
+                    raise OSError(f"{urllib.parse.urlparse(url).netloc} needs curl_cffi, "
+                                  f"which could not be installed")
                 from curl_cffi import requests as cr
+                ref = "https://pixabay.com/" if "pixabay" in url else "https://freesound.org/"
                 r = cr.get(url, impersonate="chrome", timeout=timeout,
-                           headers={"Referer": "https://pixabay.com/"})
+                           headers={"Referer": ref})
                 if r.status_code == 429:
                     _rate_limited(url, n, tries)
                     continue
@@ -137,6 +147,10 @@ def fetch(url, timeout=60, tries=3):
             # several searches run at once. A 1s/2s backoff just burns the retries.
             if e.code == 429:
                 _rate_limited(url, n, tries)
+                continue
+            if e.code == 403 and not needs_cffi:
+                # A 403 from a host we did not expect to gate: retry once through cffi.
+                needs_cffi = True
                 continue
             if n == tries - 1:
                 raise OSError(f"HTTP {e.code} {url}") from None
@@ -863,6 +877,14 @@ def get(a):
         for u in (r.get("preview"), r.get("url")):
             if u and u not in urls:
                 urls.append(u)
+        # Freesound's CDN 403s the -hq preview for some clips while -lq still serves
+        # (measured: fs:260614). Try the lower-bitrate twin before giving up — a slightly
+        # softer preview beats no file at all for judging fit.
+        if src_tag == "fs":
+            for u in [x for x in urls if "-hq.mp3" in x]:
+                lq = u.replace("-hq.mp3", "-lq.mp3")
+                if lq not in urls:
+                    urls.append(lq)
         slug = re.sub(r"[^\w]+", "-", r["title"]).strip("-")[:40]
         last = None
         for u in urls:
