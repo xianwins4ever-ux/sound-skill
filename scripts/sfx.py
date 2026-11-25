@@ -13,7 +13,7 @@ for UI sounds because its packs are purpose-built for interface clicks/switches.
   sfx.py get <dir> px:<id> fs:<id> mk:<id> kn:<path>
 """
 import argparse, html, io, json, os, platform, re, shutil, subprocess, sys, threading, time
-import urllib.parse, urllib.request, zipfile
+import urllib.error, urllib.parse, urllib.request, zipfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -111,24 +111,36 @@ def fetch(url, timeout=60, tries=3):
                 r = cr.get(url, impersonate="chrome", timeout=timeout,
                            headers={"Referer": "https://pixabay.com/"})
                 if r.status_code == 429:
-                    # Rate limited. Short backoff just burns the remaining tries, so wait
-                    # properly and say so — the caller otherwise sees a bare OSError.
-                    wait = 8 * (n + 1)
-                    if n == tries - 1:
-                        raise OSError("HTTP 429 — Pixabay is rate-limiting this machine; "
-                                      "wait a minute and retry, or use -n fewer / --pages 1")
-                    print(f"# pixabay rate-limited (429) — waiting {wait}s", file=sys.stderr)
-                    time.sleep(wait)
+                    _rate_limited(url, n, tries)
                     continue
                 if r.status_code != 200:
                     raise OSError(f"HTTP {r.status_code} {url}")
                 return r.content
             with urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=timeout) as r:
                 return r.read()
+        except urllib.error.HTTPError as e:
+            # Every catalog rate-limits, not just Pixabay — Freesound answers 429 too when
+            # several searches run at once. A 1s/2s backoff just burns the retries.
+            if e.code == 429:
+                _rate_limited(url, n, tries)
+                continue
+            if n == tries - 1:
+                raise OSError(f"HTTP {e.code} {url}") from None
+            time.sleep(1 + n)
         except Exception as e:
             if n == tries - 1:
                 raise e if isinstance(e, OSError) else OSError(repr(e))
             time.sleep(1 + n)   # Cloudflare 403s are sporadic; a short pause usually clears them
+
+
+def _rate_limited(url, n, tries):
+    host = urllib.parse.urlparse(url).netloc
+    if n == tries - 1:
+        raise OSError(f"HTTP 429 — {host} is rate-limiting this machine; wait a minute "
+                      f"and retry, or use -n fewer / --pages 1")
+    wait = 8 * (n + 1)
+    print(f"# {host} rate-limited (429) — waiting {wait}s", file=sys.stderr)
+    time.sleep(wait)
 
 
 def load_index():
@@ -250,8 +262,16 @@ def _peak_db(p):
 
 
 def _filter_dur(rows, a):
-    """Apply --min-dur / --max-dur. Rows with an unknown duration are kept: dropping them
-    would silently hide Kenney entirely, and a wrong guess is worse than a visible '?'."""
+    """Apply --min-dur / --max-dur.
+
+    Two deliberate concessions, both learned from testing:
+
+    * Rows with an unknown duration are kept. Dropping them would hide Kenney entirely.
+    * The listed duration is rounded, and always *up* on Pixabay/Mixkit (a 0.479 s pop
+      prints as "1s", a 0.452 s page turn as "0:01s"). A hard `--max-dur 0.8` therefore
+      rejected the very 0.48 s clips the flag exists to find. So the upper bound gets
+      one second of slack; `get` prints the real measured length for the final call.
+    """
     lo, hi = getattr(a, "min_dur", None), getattr(a, "max_dur", None)
     if lo is None and hi is None:
         return rows
@@ -261,7 +281,7 @@ def _filter_dur(rows, a):
         if d is not None:
             if lo is not None and d < lo:
                 continue
-            if hi is not None and d > hi:
+            if hi is not None and d > hi + 1.0:
                 continue
         out.append(r)
     return out
@@ -284,7 +304,7 @@ def _fmt(rows, a, lic=False):
             cols.append(r["license"])
         if r.get("desc"):
             cols.append(r["desc"])
-        if a.urls:
+        if a.urls and r.get("preview"):     # Kenney has no preview url — do not emit a blank column
             cols.append(r["preview"])
         print("\t".join(cols))
     if not rows and not getattr(a, "packs", False):
@@ -597,19 +617,22 @@ def _is_ui(query):
 def _non_ascii_warn(query):
     """All four catalogs are indexed in English. A CJK cue does not fail loudly — Pixabay
     answers it with unrelated clips (measured: 关门声 → "Confused Male Voice Huh"), which
-    reads like a real result. Say so instead of letting the user trust it."""
-    if any(ord(ch) > 127 for ch in query):
-        print("# ! this cue is not English. All four catalogs index English terms, so a "
-              "translated cue returns noise, not matches — translate it first "
-              "(e.g. 关门声 → door close, 翻页 → page turn, 点击 → click).",
-              file=sys.stderr)
-        return True
-    return False
+    reads like a real result. Say so instead of letting the user trust it.
+
+    Called from the CLI entry point rather than from search(): a user who runs
+    `pixabay "关门声"` directly is the one most likely to be fooled by the noise.
+    """
+    if not query or not any(ord(ch) > 127 for ch in query):
+        return False
+    print("# ! this cue is not English. All four catalogs index English terms, so a "
+          "translated cue returns noise, not matches — translate it first "
+          "(e.g. 关门声 → door close, 翻页 → page turn, 点击 → click).",
+          file=sys.stderr)
+    return True
 
 
 def search(a):
     """Run every source, then rank the way the documented workflow says."""
-    _non_ascii_warn(a.query)
     order = (["kenney", "pixabay", "freesound", "mixkit"] if _is_ui(a.query)
              else ["pixabay", "freesound", "mixkit", "kenney"])
     a_sort = argparse.Namespace(**{**vars(a), "sort": "relevance", "pages": 2, "page": 1,
@@ -682,7 +705,17 @@ def get(a):
         if src_tag == "kn":
             p = KENNEY / ref
             if not p.exists():
-                return key, None, "unknown key — run `kenney` first"
+                # The real keys look like "kn:ui-audio/Audio/click1.ogg". Typing
+                # "kn:ui-audio/click1.ogg" is the obvious mistake, and "run `kenney`
+                # first" sent the user round a loop that always succeeded and never
+                # explained the shape. Look for the stem and say the exact key.
+                want = Path(ref).stem.lower()
+                hits = [f"kn:{f.relative_to(KENNEY).as_posix()}" for f in _kenney_files()
+                        if f.stem.lower() == want][:3]
+                if hits:
+                    return key, None, "unknown key — did you mean " + " or ".join(hits) + "?"
+                return key, None, ("unknown key — copy the kn: key exactly as `kenney` printed "
+                                   "it (it includes the Audio/ segment)")
             # Keep the pack name in the filename: two packs can hold the same stem
             # (click1.ogg exists in both ui-audio and interface-sounds), and the old
             # "kn_<stem>" silently overwrote one with the other.
@@ -758,7 +791,13 @@ def get(a):
                     pass
         else:
             hint = f" — open {r['page']} by hand" if r.get("page") else ""
-            return key, None, (repr(last) if last else "no download url") + hint
+            msg = repr(last) if last else "no download url"
+            if src_tag == "mk" and "403" in str(last):
+                # Both "this id does not exist" and "the WAV is blocked" answer 403, and
+                # the preview mp3 fallback already ran — so the id itself is the problem.
+                msg = ("HTTP 403 on both the WAV and the preview — no such Mixkit id "
+                       f"{ref}; re-run the search and copy a fresh mk: key")
+            return key, None, msg + hint
         lic = r.get("license", "CC0")
         return key, dst, f"credit {r.get('author', '?')}" if lic not in ("CC0", "Mixkit Free", "Pixabay") else None
 
@@ -770,9 +809,11 @@ def get(a):
 
     # Freesound caps ~80 KB/s per connection, so parallelism is the only speed lever.
     ok = 0
+    failed = []
     with ThreadPoolExecutor(6) as ex:
         for key, dst, note in ex.map(safe, a.keys):
             if not dst:
+                failed.append(key)
                 print(f"FAIL {key}: {note}")
                 continue
             ok += 1
@@ -784,9 +825,13 @@ def get(a):
             pk = _peak_db(dst)
             peak = ""
             if pk is not None:
-                peak = f"{pk:+.1f}dB" + ("  CLIPPING" if pk > -0.1 else "")
+                peak = f"{pk:+.1f}dB" + ("  CLIPPING" if pk >= -0.1 else "")
             cols = [dst.name, dur] + ([peak] if peak else []) + ([f"[{note}]"] if note else [])
             print("\t".join(cols))
+    if failed:
+        # A partial failure used to exit 0 with the FAIL line buried in the successes.
+        print(f"\n{ok} ok, {len(failed)} failed: {', '.join(failed)}")
+        sys.exit(1)
     if not ok:
         sys.exit(1)      # every key failed — do not report success
 
@@ -854,6 +899,9 @@ def main():
     g = sp.add_parser("get"); g.add_argument("out_dir"); g.add_argument("keys", nargs="+"); g.set_defaults(fn=get)
 
     a = ap.parse_args()
+    # Warn for every subcommand that takes a query, not just `search`: running
+    # `pixabay "关门声"` directly returned unrelated clips with no hint at all.
+    _non_ascii_warn(getattr(a, "query", "") or "")
     if a.cmd in ("pixabay", "search") or (a.cmd == "get" and any(k.startswith("px:") for k in a.keys)):
         _ensure_cffi()
     try:

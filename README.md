@@ -54,27 +54,31 @@ Skill 引导 Agent：
 
 ## 直接运行脚本
 
-脚本也可独立使用。以下命令均在项目根目录执行：
+脚本也可独立使用。先按下面的方式设好 `S`（**路径是本机全局安装位置**，不是 `.claude/skills/`）：
 
 ```bash
-S=.claude/skills/sound/scripts/sfx.py
+S="$HOME/.agents/skills/sound/scripts/sfx.py"
 
 # 四源聚合，按画面动作的提示词自动决定优先级
-python3 "$S" search "soft whoosh" -n 3 --urls
+python "$S" search "soft whoosh" -n 3 --urls
 
 # 单源：Pixabay 按点赞排序
-python3 "$S" pixabay "cinematic impact" --urls
+python "$S" pixabay "cinematic impact" --urls
 
 # 单源：Freesound 只要 CC0
-python3 "$S" freesound "paper slide" --license cc0 --urls
+python "$S" freesound "paper slide" --license cc0 --urls
 
 # 下载：把占位符换成搜索返回的 ID，可一次传入多个，6 路并发
-python3 "$S" get sfx/ "px:<id>" "fs:<id>" "mk:<id>" "kn:<pack>/<file>"
+python "$S" get sfx/ "px:<id>" "fs:<id>" "mk:<id>" "kn:<pack>/Audio/<file>"
 ```
+
+> **用 `python`，不要用 `python3`。** 本机 `python3` 是 Windows 应用商店的占位程序，执行后**不输出任何内容、退出码 49**，看起来像"工具没反应"。`python3 -V` 无输出即命中此坑。
+>
+> `kn:` 的 key 必须带中间的 `Audio/` 段，写 `kn:ui-audio/click1.ogg` 会失败。搜索输出里的 key 可以原样复制，那是唯一可靠的形状。
 
 搜索结果会缓存在 `~/.cache/sfx-sources/index.json`，下载依赖这份缓存。例外：Mixkit 的下载路径可由 ID 直接推导，所以旧 ID 也能下。
 
-**格式差异值得注意**：Mixkit 先试完整 `.wav`，403 时回退到卡片的 `-preview.mp3`（有些 id 的 WAV 会 403，不回退就会"看起来能下、实际失败"）；Kenney 是 `.ogg`，`get` 会自动用 ffmpeg 转 mp3，文件名保留包名（`kn_ui-audio_click1.mp3`），因为两个包里存在同名文件；Pixabay 与 Freesound 给 mp3。
+**格式差异值得注意**：Mixkit 先试完整 `.wav`，403 时回退到卡片的 `-preview.mp3`（有些 id 的 WAV 会 403，不回退就会"看起来能下、实际失败"）；Kenney 是 `.ogg`，`get` 会自动用 ffmpeg 转 mp3，文件名保留包名（`kn_ui-audio_click1.mp3`）以便追溯来源；Pixabay 与 Freesound 给 mp3。`ffmpeg` / `ffprobe` 会先在 PATH 里找，再查常见安装目录，都没有才保留原始 `.ogg` 并把时长显示为 `?s`。
 
 常用参数：
 
@@ -83,12 +87,14 @@ python3 "$S" get sfx/ "px:<id>" "fs:<id>" "mk:<id>" "kn:<pack>/<file>"
 | `--license cc0` | 仅搜索 CC0（仅 Freesound 支持） |
 | `--license by` | 搜索 CC0 和 Attribution（仅 Freesound） |
 | `--min-dur 0.3` | 丢掉短于该秒数的结果（未知时长的保留） |
-| `--max-dur 0.8` | 丢掉长于该秒数的结果——解决"0.2 秒的卡片弹出返回 55 秒循环音" |
-| `--urls` | 显示试听链接 |
-| `-n 5` | 最多显示 5 条结果，默认 8 条 |
-| `--sort relevance` | 取相关结果后按下载量重排，默认方式（Freesound） |
-| `--pages 3` | 从起始页抓取的页数，Pixabay 每页 20、Freesound 每页 15 |
-| `-p 2` | 从第 2 页开始搜索，默认第 1 页 |
+| `--max-dur 0.8` | 丢掉长于该秒数的结果——解决"0.2 秒的卡片弹出返回 55 秒循环音"。**留 1 秒余量**，因为列表时长向上取整 |
+| `--urls` | 显示试听链接（Kenney 没有链接，不出该列） |
+| `-n 5` | 最多显示 5 条结果。默认 8 条（kenney 默认 20） |
+| `--sort relevance` | 取相关结果后按下载量重排，默认方式（仅 Freesound） |
+| `--pages 3` | 抓取页数，Pixabay 每页 20、Freesound 每页 15（**仅 Pixabay / Freesound**） |
+| `-p 2` | 从第 2 页开始搜索，默认第 1 页（**仅 Pixabay / Freesound**） |
+
+`--pages` / `-p` / `--sort` / `--license` 只对支持它的源有效，混用会直接报 `unrecognized arguments`。
 
 `--min-dur` / `--max-dur` 只过滤打印结果，**所有结果仍然写进缓存**，所以被过滤掉的条目之后照样能按 key 下载。
 
