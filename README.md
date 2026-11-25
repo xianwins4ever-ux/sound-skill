@@ -96,7 +96,9 @@ mk_1492_Cinematic-whoosh-fast-transition.wav   1.334s  -0.5dB
 git clone https://github.com/xianwins4ever-ux/sound-skill.git ~/.agents/skills/sound
 ```
 
-需要 Python 3。Pixabay 在 Cloudflare 后面，首次调用会自动装 `curl_cffi` 到一个私有 venv（约 10 秒，不动系统环境）。ffmpeg / ffprobe 可选——没有的话 Kenney 的 ogg 不转码，时长显示 `?s`，其余功能正常。
+`~/.agents/skills/` 是跨 agent 通用的 skill 目录，[CC]、Codex 都能读到。只用 [CC] 的话也可以装到 `~/.claude/skills/sound`，命令一样。
+
+需要 Python 3。Pixabay 在 Cloudflare 后面，首次调用会自动装 `curl_cffi` 到一个私有 venv（约 10 秒，不动系统环境）。ffmpeg / ffprobe 可选——没有的话 Kenney 的 ogg 不转码，时长显示 `?s`，其余功能正常。装在非默认位置时，`ffmpeg` 找不到可以设 `SFX_FFMPEG_DIR` 指向它的目录。
 
 ## 用法
 
