@@ -285,9 +285,16 @@ def _find_tool(name):
     if exe:
         return exe
     sub = f"{name}.exe" if platform.system() == "Windows" else name
-    for d in (Path("C:/Program Files/FFmpeg/bin"),
-              Path("D:/AgentHub/_tools/hyperframes-tools/ffmpeg"),
-              Path("/usr/bin"), Path("/usr/local/bin"), Path("/opt/homebrew/bin")):
+    roots = [
+        Path("C:/Program Files/FFmpeg/bin"),
+        Path("C:/ffmpeg/bin"),
+        Path("/usr/bin"), Path("/usr/local/bin"), Path("/opt/homebrew/bin"),
+    ]
+    # Escape hatch for installs that live somewhere unusual.
+    env = os.environ.get("SFX_FFMPEG_DIR")
+    if env:
+        roots.insert(0, Path(env))
+    for d in roots:
         c = d / sub
         if c.exists():
             return str(c)
