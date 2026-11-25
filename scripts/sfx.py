@@ -185,16 +185,28 @@ def _parse_dur(s):
         return None
 
 
-def _find_ffprobe():
-    exe = shutil.which("ffprobe")
+def _find_tool(name):
+    """Locate ffmpeg/ffprobe. PATH first, then the usual install spots.
+
+    Both are looked up the same way on purpose: ffprobe used to have fallback paths
+    while ffmpeg did not, so a machine with FFmpeg installed but not on PATH could
+    measure a clip's duration and still fail to convert it.
+    """
+    exe = shutil.which(name)
     if exe:
         return exe
-    for c in (Path("C:/Program Files/FFmpeg/bin/ffprobe.exe"),
-              Path("D:/AgentHub/_tools/hyperframes-tools/ffmpeg/ffprobe.exe"),
-              Path("/usr/bin/ffprobe"), Path("/opt/homebrew/bin/ffprobe")):
+    sub = f"{name}.exe" if platform.system() == "Windows" else name
+    for d in (Path("C:/Program Files/FFmpeg/bin"),
+              Path("D:/AgentHub/_tools/hyperframes-tools/ffmpeg"),
+              Path("/usr/bin"), Path("/usr/local/bin"), Path("/opt/homebrew/bin")):
+        c = d / sub
         if c.exists():
             return str(c)
     return None
+
+
+def _find_ffprobe():
+    return _find_tool("ffprobe")
 
 
 def _ffprobe_dur(p):
@@ -222,7 +234,7 @@ def _peak_db(p):
     Measured on real Pixabay hits: one popular whoosh peaks at +1.5 dBFS — it will
     distort the moment it is placed in a mix, and nothing in the listing says so.
     """
-    exe = shutil.which("ffmpeg")
+    exe = _find_tool("ffmpeg")
     if not exe:
         return None
     try:
@@ -645,7 +657,7 @@ def _to_mp3(src, dst):
     if src.suffix.lower() == ".mp3":
         shutil.copy2(src, dst)
         return True
-    ff = shutil.which("ffmpeg")
+    ff = _find_tool("ffmpeg")
     if not ff:
         return False
     r = subprocess.run([ff, "-y", "-loglevel", "error", "-i", str(src),
@@ -675,7 +687,7 @@ def get(a):
             # (click1.ogg exists in both ui-audio and interface-sounds), and the old
             # "kn_<stem>" silently overwrote one with the other.
             pack = p.parent.parent.name if p.parent.name.lower() == "audio" else p.parent.name
-            dst = out / f"kn_{re.sub(r'[^\w]+', '-', pack)}_{re.sub(r'[^\w]+', '-', p.stem)}{'.mp3' if shutil.which('ffmpeg') else p.suffix}"
+            dst = out / f"kn_{re.sub(r'[^\w]+', '-', pack)}_{re.sub(r'[^\w]+', '-', p.stem)}{'.mp3' if _find_tool('ffmpeg') else p.suffix}"
             if not dst.exists() and not _to_mp3(p, dst):
                 dst = out / f"kn_{re.sub(r'[^\w]+', '-', pack)}_{p.name}"
                 if not dst.exists():
