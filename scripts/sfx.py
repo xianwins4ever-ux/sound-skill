@@ -316,8 +316,9 @@ def freesound(a):
     if a.sort == "relevance":
         rows.sort(key=lambda r: -r["downloads"])
     if not rows:
-        print("# freesound: parsed 0 results — if the site loads fine in a browser, its "
-              "markup changed and the selectors need updating", file=sys.stderr)
+        if all(ord(c) < 128 for c in a.query):
+            print("# freesound: parsed 0 results — if the site loads fine in a browser, its "
+                  "markup changed and the selectors need updating", file=sys.stderr)
     return rows[: a.n]
 
 
@@ -384,8 +385,9 @@ def pixabay(a):
     rows = [r for r in rows if r["url"]] + [r for r in rows if not r["url"]]
     rows.sort(key=lambda r: -r["likes"])
     if not rows:
-        print("# pixabay: parsed 0 results — if the search page loads in a browser, its "
-              "markup changed (or Cloudflare is serving a challenge)", file=sys.stderr)
+        if all(ord(c) < 128 for c in a.query):
+            print("# pixabay: parsed 0 results — if the search page loads in a browser, its "
+                  "markup changed (or Cloudflare is serving a challenge)", file=sys.stderr)
     return rows[: a.n]
 
 
@@ -580,8 +582,22 @@ def _is_ui(query):
     return bool(set(re.split(r"[^a-z0-9]+", query.lower())) & UI_HINTS)
 
 
+def _non_ascii_warn(query):
+    """All four catalogs are indexed in English. A CJK cue does not fail loudly — Pixabay
+    answers it with unrelated clips (measured: 关门声 → "Confused Male Voice Huh"), which
+    reads like a real result. Say so instead of letting the user trust it."""
+    if any(ord(ch) > 127 for ch in query):
+        print("# ! this cue is not English. All four catalogs index English terms, so a "
+              "translated cue returns noise, not matches — translate it first "
+              "(e.g. 关门声 → door close, 翻页 → page turn, 点击 → click).",
+              file=sys.stderr)
+        return True
+    return False
+
+
 def search(a):
     """Run every source, then rank the way the documented workflow says."""
+    _non_ascii_warn(a.query)
     order = (["kenney", "pixabay", "freesound", "mixkit"] if _is_ui(a.query)
              else ["pixabay", "freesound", "mixkit", "kenney"])
     a_sort = argparse.Namespace(**{**vars(a), "sort": "relevance", "pages": 2, "page": 1,
