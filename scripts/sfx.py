@@ -717,12 +717,24 @@ def get(a):
             tmp = dst.parent / f"{dst.name}.{os.getpid()}.{threading.get_ident()}.part"
             try:
                 tmp.write_bytes(fetch(u, timeout=300))
-                os.replace(tmp, dst)
-                # Sweep leftovers: older versions used "<dst>.part", and a killed run
-                # leaves its own pid-stamped file behind. Both are dead weight now.
+                try:
+                    os.replace(tmp, dst)
+                except PermissionError:
+                    # Windows: another process holds dst open, or won the race and is
+                    # mid-replace. If a complete file is there now, that is success.
+                    if dst.exists() and dst.stat().st_size > 0:
+                        tmp.unlink(missing_ok=True)
+                        break
+                    raise
+                # Sweep leftovers, but only ones nobody is writing: a sibling process
+                # downloads into its own pid-stamped .part, and deleting that mid-write
+                # made the loser die with PermissionError. Anything touched in the last
+                # 10 minutes may still be live.
+                cutoff = time.time() - 600
                 for stale in dst.parent.glob(f"{dst.name}*.part"):
                     try:
-                        stale.unlink()
+                        if stale.stat().st_mtime < cutoff:
+                            stale.unlink()
                     except OSError:
                         pass
                 break
