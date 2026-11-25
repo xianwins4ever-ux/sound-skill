@@ -12,7 +12,7 @@ for UI sounds because its packs are purpose-built for interface clicks/switches.
   sfx.py kenney    "<query>"   local CC0 pack index (first run downloads ~1 MB)
   sfx.py get <dir> px:<id> fs:<id> mk:<id> kn:<path>
 """
-import argparse, html, io, json, os, platform, re, shutil, subprocess, sys, threading, time
+import argparse, contextlib, html, io, json, os, platform, re, shutil, subprocess, sys, threading, time
 import urllib.error, urllib.parse, urllib.request, zipfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -48,6 +48,22 @@ def _venv_python(venv):
     return venv / ("Scripts/python.exe" if platform.system() == "Windows" else "bin/python")
 
 
+def _cffi_ok():
+    """True only if curl_cffi is genuinely importable *and* usable.
+
+    `import curl_cffi` is not a health check: an interrupted pip install leaves a
+    directory without __init__.py, which Python 3 accepts as a namespace package — the
+    import succeeds, __file__ is None, and the real failure only shows up later as
+    "ImportError: DLL load failed". Importing the submodule actually used does the job.
+    """
+    try:
+        from curl_cffi import requests as _r  # noqa: F401
+        import curl_cffi
+        return curl_cffi.__file__ is not None
+    except Exception:
+        return False
+
+
 def _ensure_cffi(verbose=True):
     """Make `curl_cffi` importable, building a private venv on first use.
 
@@ -61,11 +77,8 @@ def _ensure_cffi(verbose=True):
     quoting. Instead the venv's site-packages is appended to sys.path and imported
     in-process — same interpreter version, so the compiled extension loads fine.
     """
-    try:
-        import curl_cffi  # noqa: F401
+    if _cffi_ok():
         return True
-    except ImportError:
-        pass
 
     # Two attempts: the second rebuilds the venv from scratch. The old code only built
     # when the interpreter was missing, so a venv with a broken site-packages returned
@@ -73,7 +86,7 @@ def _ensure_cffi(verbose=True):
     for attempt in (0, 1):
         if attempt:
             if verbose:
-                print("# curl_cffi import still failing — rebuilding the venv", file=sys.stderr)
+                print("# curl_cffi still unusable — rebuilding the venv", file=sys.stderr)
             shutil.rmtree(VENV, ignore_errors=True)
         py = _venv_python(VENV)
         if not py.exists():
@@ -91,11 +104,12 @@ def _ensure_cffi(verbose=True):
         for sp in list(VENV.glob("Lib/site-packages")) + list(VENV.glob("lib/python*/site-packages")):
             if str(sp) not in sys.path:
                 sys.path.insert(0, str(sp))
-        try:
-            import curl_cffi  # noqa: F401
+        # Drop a half-imported module left by an earlier failed attempt, or the stale
+        # entry in sys.modules keeps answering for the rebuilt venv.
+        for mod in [m for m in sys.modules if m == "curl_cffi" or m.startswith("curl_cffi.")]:
+            del sys.modules[mod]
+        if _cffi_ok():
             return True
-        except ImportError:
-            continue
     if verbose:
         print("# ! curl_cffi could not be imported — Pixabay unavailable", file=sys.stderr)
     return False
@@ -165,23 +179,86 @@ def load_index():
         return {}
 
 
-def save_index(rows):
-    """Merge rows into the cache and write it atomically.
+@contextlib.contextmanager
+def _index_lock(timeout=15):
+    """Exclusive lock around the read-modify-write of index.json.
 
-    Closes two failure modes: write_text() truncates in place, so a crash mid-write
-    leaves an unreadable cache; and writing to the live path lets two concurrent
-    searches interleave. Empty input never touches the file — `kenney --packs` used to
-    call save_index([]) and rewrite the cache for no reason.
+    Atomic replace alone only prevented a *corrupt* file; it did not prevent *lost
+    updates*. Measured: 8 processes each saving one key, 4 survived, all exited 0 — the
+    other four keys silently never entered the cache, so a later `get` said "unknown key".
+    """
+    CACHE.mkdir(parents=True, exist_ok=True)
+    lock = CACHE / "index.lock"
+    fh = None
+    deadline = time.time() + timeout
+    while True:
+        try:
+            fh = open(lock, "a+b")
+            if platform.system() == "Windows":
+                import msvcrt
+                msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except OSError:
+            if fh:
+                fh.close()
+                fh = None
+            if time.time() > deadline:
+                # Locked for 15 s means a stuck holder, not contention. Proceed without
+                # the lock rather than fail the user's search outright.
+                yield False
+                return
+            time.sleep(0.05)
+    try:
+        yield True
+    finally:
+        try:
+            if platform.system() == "Windows":
+                import msvcrt
+                fh.seek(0)
+                msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        fh.close()
+
+
+def save_index(rows):
+    """Merge rows into the cache and write it atomically, under a lock.
+
+    Three failure modes this closes, all measured on the previous version:
+    concurrent writers silently losing each other's keys; a crash mid-write leaving an
+    unreadable cache; and Windows `os.replace` failing with WinError 5 while another
+    process holds the file, which left a 448 KB .tmp behind on every attempt.
     """
     rows = [r for r in rows if r.get("key")]
     if not rows:
-        return
+        return                      # `kenney --packs` used to rewrite the cache for nothing
     CACHE.mkdir(parents=True, exist_ok=True)
-    idx = load_index()
-    idx.update({r["key"]: r for r in rows})
-    tmp = INDEX.parent / f"{INDEX.name}.{os.getpid()}.tmp"
-    tmp.write_text(json.dumps(idx, ensure_ascii=False), encoding="utf-8")
-    os.replace(tmp, INDEX)      # atomic on both Windows and POSIX
+    tmp = INDEX.parent / f"{INDEX.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+    with _index_lock():
+        try:
+            idx = load_index()
+            idx.update({r["key"]: r for r in rows})
+            tmp.write_text(json.dumps(idx, ensure_ascii=False), encoding="utf-8")
+            for attempt in range(5):
+                try:
+                    os.replace(tmp, INDEX)      # atomic on both Windows and POSIX
+                    break
+                except PermissionError:
+                    # Windows: another process has the target open. Retry briefly.
+                    if attempt == 4:
+                        raise
+                    time.sleep(0.1 * (attempt + 1))
+        finally:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def _parse_dur(s):
@@ -261,16 +338,22 @@ def _peak_db(p):
         return None
 
 
+def _dur_slack(hi):
+    """How much the listed duration may exceed --max-dur and still be kept.
+
+    Listings round *up* (a 0.479 s pop prints as "1s", a 0.452 s page turn as "0:01s"),
+    so a hard bound rejects the very clips the flag is meant to find. But a flat +1.0 s
+    was far too loose for short cues: `--max-dur 0.8` admitted a 1.056 s clip. Scale the
+    allowance instead — generous in absolute terms for sub-second cues, tight for long ones.
+    """
+    return max(0.35, min(1.0, hi * 0.5))
+
+
 def _filter_dur(rows, a):
     """Apply --min-dur / --max-dur.
 
-    Two deliberate concessions, both learned from testing:
-
-    * Rows with an unknown duration are kept. Dropping them would hide Kenney entirely.
-    * The listed duration is rounded, and always *up* on Pixabay/Mixkit (a 0.479 s pop
-      prints as "1s", a 0.452 s page turn as "0:01s"). A hard `--max-dur 0.8` therefore
-      rejected the very 0.48 s clips the flag exists to find. So the upper bound gets
-      one second of slack; `get` prints the real measured length for the final call.
+    Rows with an unknown duration are kept: dropping them would hide Kenney entirely.
+    `get` prints the real measured length, which is the only number worth trusting.
     """
     lo, hi = getattr(a, "min_dur", None), getattr(a, "max_dur", None)
     if lo is None and hi is None:
@@ -281,7 +364,7 @@ def _filter_dur(rows, a):
         if d is not None:
             if lo is not None and d < lo:
                 continue
-            if hi is not None and d > hi + 1.0:
+            if hi is not None and d > hi + _dur_slack(hi):
                 continue
         out.append(r)
     return out
@@ -703,8 +786,16 @@ def get(a):
     def one(key):
         src_tag, sep, ref = key.partition(":")
         if src_tag == "kn":
-            p = KENNEY / ref
-            if not p.exists():
+            # The key is user input. "kn:../../../.gitconfig" used to resolve outside the
+            # pack cache and copy any readable file into the output dir — an arbitrary
+            # read, from a value that looks like a sound id.
+            p = (KENNEY / ref).resolve()
+            try:
+                p.relative_to(KENNEY.resolve())
+            except ValueError:
+                return key, None, ("unsupported key — a kn: key must stay inside the "
+                                   "Kenney cache; copy the key exactly as `kenney` printed it")
+            if not p.is_file():
                 # The real keys look like "kn:ui-audio/Audio/click1.ogg". Typing
                 # "kn:ui-audio/click1.ogg" is the obvious mistake, and "run `kenney`
                 # first" sent the user round a loop that always succeeded and never
@@ -867,21 +958,25 @@ def main():
                        help="drop results shorter than this (unknown durations are kept)")
         p.add_argument("--max-dur", type=float, metavar="SEC",
                        help="drop results longer than this — the fix for a 0.2s cue "
-                            "returning a 55s loop")
+                            "returning a 55s loop (allows 1s slack: listings round up)")
+
+    def pages_arg(p):
+        # Unbounded --pages built a 9999-worker pool and walked Pixabay to page 295, where
+        # it got rate-limited after 194 s — losing the 294 pages already fetched.
+        p.add_argument("-p", "--page", type=int, default=1)
+        p.add_argument("--pages", type=int, default=3,
+                       help="pages to fetch, capped at 20 (Pixabay 20/page, Freesound 15/page)")
 
     s = sp.add_parser("search"); common(s)
     s.add_argument("--license", choices=FS_LICENSE, default="any"); s.set_defaults(fn=search)
 
-    x = sp.add_parser("pixabay"); common(x)
-    x.add_argument("-p", "--page", type=int, default=1)
-    x.add_argument("--pages", type=int, default=3, help="relevance pages (20 each) to rank by likes")
+    x = sp.add_parser("pixabay"); common(x); pages_arg(x)
     x.set_defaults(fn=lambda a: _fmt(pixabay(a), a))
 
     f = sp.add_parser("freesound"); common(f)
     f.add_argument("--license", choices=FS_LICENSE, default="any")
     f.add_argument("--sort", choices=FS_SORT, default="relevance")
-    f.add_argument("-p", "--page", type=int, default=1)
-    f.add_argument("--pages", type=int, default=3, help="relevance pages (15 each) to rank by downloads")
+    pages_arg(f)
     f.set_defaults(fn=lambda a: _fmt(freesound(a), a, lic=a.license != "cc0"))
 
     m = sp.add_parser("mixkit"); common(m); m.set_defaults(fn=lambda a: _fmt(mixkit(a), a))
@@ -899,6 +994,20 @@ def main():
     g = sp.add_parser("get"); g.add_argument("out_dir"); g.add_argument("keys", nargs="+"); g.set_defaults(fn=get)
 
     a = ap.parse_args()
+    # Clamp numeric inputs once, here, rather than trusting every call site. `-n -1` used
+    # to hit a Python negative slice and return more rows than the default; `--pages 0`
+    # built an empty pool; `--pages 9999` walked Pixabay into a 429.
+    if hasattr(a, "n"):
+        a.n = max(1, min(a.n, 500))
+    if hasattr(a, "pages"):
+        a.pages = max(1, min(a.pages, 20))
+    if hasattr(a, "page"):
+        a.page = max(1, a.page)
+    # An empty query silently listed the most popular clips from every source, which
+    # looks like a result set. Refuse it instead.
+    q = getattr(a, "query", None)
+    if q is not None and not q.strip() and a.cmd in ("search", "pixabay", "freesound", "mixkit"):
+        sys.exit('query is empty — pass a cue, e.g. search "click"')
     # Warn for every subcommand that takes a query, not just `search`: running
     # `pixabay "关门声"` directly returned unrelated clips with no hint at all.
     _non_ascii_warn(getattr(a, "query", "") or "")
