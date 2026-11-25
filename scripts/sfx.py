@@ -306,22 +306,37 @@ def _find_ffprobe():
 
 
 def _ffprobe_dur(p):
-    """Measured duration in seconds, or None when ffprobe is unavailable.
+    """Measured duration in seconds, or None when no tool can read it.
 
     The catalog duration is useless for short one-shots: Pixabay rounds to whole seconds
     (a 0.575 s whoosh prints as "1s"), Mixkit rounds up ("0:01s" is really 0.452 s), and
     Kenney has none at all. Measuring the downloaded file is the only trustworthy number.
+
+    ffprobe is preferred but not required — plenty of installs ship ffmpeg alone (this
+    machine's C:\\Program Files\\FFmpeg\\bin has ffmpeg.exe and no ffprobe.exe), so fall
+    back to parsing the Duration line out of `ffmpeg -i`.
     """
-    exe = _find_ffprobe()
-    if not exe:
+    exe = _find_tool("ffprobe")
+    if exe:
+        try:
+            r = subprocess.run([exe, "-v", "error", "-show_entries", "format=duration",
+                                "-of", "csv=p=0", str(p)],
+                               capture_output=True, text=True, timeout=60)
+            return float(r.stdout.strip())
+        except Exception:
+            pass
+    ff = _find_tool("ffmpeg")
+    if not ff:
         return None
     try:
-        r = subprocess.run([exe, "-v", "error", "-show_entries", "format=duration",
-                            "-of", "csv=p=0", str(p)],
+        r = subprocess.run([ff, "-hide_banner", "-i", str(p)],
                            capture_output=True, text=True, timeout=60)
-        return float(r.stdout.strip())
+        m = re.search(r"Duration:\s*(\d+):(\d+):([\d.]+)", r.stderr)
+        if m:
+            return int(m[1]) * 3600 + int(m[2]) * 60 + float(m[3])
     except Exception:
-        return None
+        pass
+    return None
 
 
 def _peak_db(p):
